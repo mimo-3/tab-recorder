@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Recorder",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz74hUPf5AtHzgUjsQ7sw16JaDnt6Fk8Uuu+ljGFUCil7lHKAti/7waBSKJ9Kv0UglnSXe/N7X1WqHC/0hpelAT4lPjeCyfDlNui6Z29ayBUIKcYYZJiEoyE/BaDkSk47jLEvJTn4NDN8JeQ1pnHLXbti4GGn77h91jWYvYKFHaTyw3RYgiKrftz4iwvC3kERFyEuyqlSKNT7fmHD+GXfMD+zhouwzO3I9JetREG7QeyVEucmzSVSTyckiiV8W3wY6Q5y4lSDefwjAAsY482iTligHGxhLD16sL08inzXge90sVlxHdUiRTBgw0oviHjYGYwyn2+zcOw8siGeVgG/YwIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "debugger",
+    "tabs",
+    "management",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Tab Recorder"
+  }
+}
