@@ -1,0 +1,5 @@
+node_modules/
+.harness-output/
+*.mp4
+*.sock
+.DS_Store
