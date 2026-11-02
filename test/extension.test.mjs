@@ -68,7 +68,7 @@ test('capture persists target and generation, clamps width and shows REC', async
   const {chrome, calls, session} = mockChrome();
   const recorder = createRecorder(chrome, () => {});
   await recorder.dispatch(start);
-  assert.deepEqual(session.capture, {tabId: 1, generation: 'g'});
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g'}]);
   assert.ok(calls.some(call => call[0] === 'badge' && call[1] === 'REC'));
   const capture = calls.find(call => call[1] === 'Page.startScreencast');
   assert.equal(capture[2].maxWidth, 3840);
@@ -105,7 +105,7 @@ test('missing timestamp uses receipt time and stale generation acknowledgments a
   await recorder.acknowledge({generation: 'stale', ack: 4});
   assert.equal(calls.filter(call => call[1] === 'Page.screencastFrameAck').length, 0);
   await recorder.detached({tabId: 1});
-  assert.deepEqual(messages[1], {type: 'detached', stoppedAt: 123});
+  assert.deepEqual(messages[1], {type: 'detached', generation: 'g', tabId: 1, stoppedAt: 123});
 });
 
 test('failed detach logs failures and retains capture and REC until retry succeeds', async () => {
@@ -117,7 +117,7 @@ test('failed detach logs failures and retains capture and REC until retry succee
   chrome.debugger.detach = async () => { throw new Error('temporary debugger error'); };
   chrome.debugger.sendCommand = async () => { throw new Error('stop failed'); };
   await assert.rejects(recorder.cleanup(), /temporary debugger error/);
-  assert.deepEqual(session.capture, {tabId: 1, generation: 'g'});
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g'}]);
   assert.equal(calls.filter(call => call[0] === 'badge' && call[1] === '').length, 0);
   assert.equal(errors.length, 2);
   chrome.debugger.detach = detach;
@@ -144,6 +144,64 @@ test('start failure remains original even when debugger detach fails', async () 
   const errors = [];
   const recorder = createRecorder(chrome, () => {}, {logger: {error: (...args) => errors.push(args)}});
   await assert.rejects(recorder.dispatch(start), error => error === original);
-  assert.deepEqual(session.capture, {tabId: 1, generation: 'g'});
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g'}]);
   assert.equal(errors.length, 3);
+});
+
+test('parallel targets route frames and acknowledgments and keep per-tab indicators', async () => {
+  const {chrome, session} = mockChrome();
+  chrome.tabs.query = async () => [{id: 1}, {id: 2}];
+  const badges = [], commands = [], messages = [];
+  chrome.action.setBadgeText = async v => badges.push(v);
+  chrome.debugger.sendCommand = async (target, method, params) => commands.push({target, method, params});
+  const recorder = createRecorder(chrome, v => messages.push(v));
+  await recorder.dispatch({...start, tab: '1'});
+  await recorder.dispatch({...start, tab: '2', generation: 'h'});
+  await assert.rejects(recorder.dispatch({...start, tab: '1', generation: 'i'}), /already recording/);
+  assert.equal(session.capture.length, 2);
+  for (const tabId of [2, 1]) recorder.onFrame({tabId}, 'Page.screencastFrame', {data: String(tabId), sessionId: tabId});
+  assert.deepEqual(messages.map(v => [v.tabId, v.generation, v.data]), [[2, 'h', '2'], [1, 'g', '1']]);
+  await recorder.acknowledge({generation: 'h', ack: 2});
+  assert.deepEqual(commands.at(-1).target, {tabId: 2});
+  await recorder.dispatch({type: 'stop', generation: 'g'});
+  assert.deepEqual(session.capture, [{tabId: 2, generation: 'h'}]);
+  assert.deepEqual(badges, [{tabId: 1, text: 'REC'}, {tabId: 2, text: 'REC'}, {tabId: 1, text: ''}]);
+  await recorder.acknowledge({generation: 'g', ack: 1});
+  await recorder.detached({tabId: 2});
+  assert.equal(messages.at(-1).generation, 'h');
+});
+
+test('shared extension pause is restored only after last owner and restart cleans all targets', async () => {
+  const {chrome, local, session, calls} = mockChrome();
+  chrome.tabs.query = async () => [{id: 1}, {id: 2}];
+  chrome.tabs.onUpdated = {addListener: fn => { chrome.tabs.listener = fn; }, removeListener: () => {}};
+  chrome.tabs.reload = async id => chrome.tabs.listener(id, {status: 'complete'});
+  const recorder = createRecorder(chrome, () => {});
+  await recorder.dispatch({...start, tab: '1', pauseExtensions: ['a']});
+  await recorder.dispatch({...start, tab: '2', generation: 'h', pauseExtensions: ['a']});
+  assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === false).length, 1);
+  await recorder.dispatch({type: 'stop', generation: 'g'});
+  assert.deepEqual(local.paused, ['a']);
+  assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === true).length, 0);
+  await recorder.dispatch({type: 'stop', generation: 'h'});
+  assert.deepEqual(local.paused, []);
+  assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === true).length, 1);
+  session.capture = [{tabId: 10, generation: 'old1'}, {tabId: 20, generation: 'old2'}];
+  local.paused = ['a'];
+  await createRecorder(chrome, () => {}).cleanup();
+  assert.equal(session.capture, undefined);
+  assert.ok([10, 20].every(id => calls.some(c => c[0] === 'detach' && c[1].tabId === id)));
+  assert.deepEqual(local.paused, []);
+});
+
+test('queued detach from an old generation cannot clear a replacement capture', async () => {
+  const {chrome, session} = mockChrome();
+  const recorder = createRecorder(chrome, () => {});
+  await recorder.dispatch(start);
+  const old = recorder.generationFor(1);
+  await recorder.dispatch({type: 'stop', generation: old});
+  await recorder.dispatch({...start, generation: 'replacement'});
+  await recorder.detached({tabId: 1, generation: old});
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'replacement'}]);
+  await recorder.cleanup();
 });

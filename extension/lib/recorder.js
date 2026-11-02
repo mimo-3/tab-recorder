@@ -74,119 +74,151 @@ function reload(chrome, tabId) {
 }
 
 export function createRecorder(chrome, send, {now = () => Date.now() / 1000, logger = console} = {}) {
-  let target;
-  let generation;
+  const targets = new Map();
+  const refs = new Map();
 
-  async function clearIndicator() {
-    await chrome.action.setBadgeText({text: ''});
-    await chrome.action.setTitle({title: DEFAULT_TITLE});
+  async function persist() {
+    if (targets.size) await chrome.storage.session.set({capture: [...targets.values()].map(({tabId, generation}) => ({tabId, generation}))});
+    else await chrome.storage.session.remove(CAPTURE_KEY);
+  }
+
+  async function release(ids = []) {
+    for (const id of ids) {
+      const count = refs.get(id);
+      if (count > 1) refs.set(id, count - 1);
+      else refs.delete(id);
+    }
+    const {paused = []} = await chrome.storage.local.get('paused');
+    const remaining = [];
+    const installed = new Set((await chrome.management.getAll()).map(e => e.id));
+    for (const id of paused) {
+      if (refs.has(id)) { remaining.push(id); continue; }
+      if (!installed.has(id)) continue;
+      try { await chrome.management.setEnabled(id, true); }
+      catch { remaining.push(id); }
+    }
+    await chrome.storage.local.set({paused: remaining});
+    if (remaining.some(id => !refs.has(id))) throw new Error('Could not restore extensions');
+  }
+
+  async function clearIndicator(tabId) {
+    await chrome.action.setBadgeText({tabId, text: ''});
+    await chrome.action.setTitle({tabId, title: DEFAULT_TITLE});
+  }
+
+  async function cleanupTarget(current, recovering = false) {
+    const target = {tabId: current.tabId};
+    try { await chrome.debugger.sendCommand(target, 'Page.stopScreencast'); }
+    catch (error) { logger.error('Could not stop screencast during cleanup', error); }
+    try { await chrome.debugger.detach(target); }
+    catch (error) {
+      logger.error('Could not detach debugger during cleanup', error);
+      if (!/Debugger is not attached to the tab with id:|No tab with (?:given )?id:?/i.test(error.message)) throw error;
+    }
+    targets.delete(current.tabId);
+    await persist();
+    try { if (!recovering) await release(current.paused); }
+    finally { await clearIndicator(current.tabId); }
   }
 
   async function cleanup() {
     const saved = (await chrome.storage.session.get(CAPTURE_KEY))[CAPTURE_KEY];
-    const current = target || (saved && {tabId: saved.tabId});
-    let detachError;
-    if (current) {
-      try {
-        await chrome.debugger.sendCommand(current, 'Page.stopScreencast');
-      } catch (error) {
-        logger.error('Could not stop screencast during cleanup', error);
-      }
-      try {
-        await chrome.debugger.detach(current);
-      } catch (error) {
-        logger.error('Could not detach debugger during cleanup', error);
-        // Chrome reports these when the tab closed or the debugger already detached.
-        const alreadyDetached = /Debugger is not attached to the tab with id:|No tab with (?:given )?id:?/i.test(error.message);
-        if (!alreadyDetached) detachError = error;
-      }
+    for (const entry of (Array.isArray(saved) ? saved : saved ? [saved] : [])) {
+      if (!targets.has(entry.tabId)) targets.set(entry.tabId, entry);
     }
-    try {
-      if (!detachError) {
-        target = undefined;
-        generation = undefined;
-        await chrome.storage.session.remove(CAPTURE_KEY);
-      }
-    } finally {
-      try {
-        await restoreExtensions(chrome);
-      } finally {
-        // Keep REC and the persisted capture as recovery evidence if detach failed.
-        if (!detachError) await clearIndicator();
-      }
+    const recovering = refs.size === 0;
+    const errors = [];
+    for (const current of [...targets.values()]) {
+      try { await cleanupTarget(current, recovering); } catch (error) { errors.push(error); }
     }
-    if (detachError) throw detachError;
+    if (!targets.size) await release();
+    if (errors.length) throw errors[0];
+  }
+
+  async function acquire(ids = [], current) {
+    if (ids.includes(chrome.runtime.id)) throw new Error('Cannot pause Tab Recorder');
+    const installed = new Map((await chrome.management.getAll()).map(e => [e.id, e]));
+    for (const id of new Set(ids)) {
+      if (refs.has(id)) {
+        refs.set(id, refs.get(id) + 1);
+        current.paused.push(id);
+        continue;
+      }
+      const extension = installed.get(id);
+      if (!extension?.enabled || extension.mayDisable === false) continue;
+      const {paused = []} = await chrome.storage.local.get('paused');
+      await chrome.storage.local.set({paused: [...new Set([...paused, id])]});
+      refs.set(id, 1);
+      current.paused.push(id);
+      await chrome.management.setEnabled(id, false);
+    }
   }
 
   async function startCapture(command) {
-    if (target) throw new Error('Already recording');
-    await restoreExtensions(chrome);
     const tab = await selectTab(chrome, command.tab);
+    if (targets.has(tab.id)) throw new Error('Tab is already recording');
+    if (targets.size >= 4) throw new Error('Maximum 4 sessions reached');
+    if ([...targets.values()].some(t => t.generation === command.generation)) throw new Error('Duplicate generation');
+    const current = {tabId: tab.id, generation: command.generation, paused: []};
+    let attached = false;
     try {
-      const paused = await pauseExtensions(chrome, command.pauseExtensions);
-      if (paused.length) await reload(chrome, tab.id);
-      const next = {tabId: tab.id};
-      await chrome.debugger.attach(next, '1.3');
-      target = next;
-      generation = command.generation;
-      await chrome.storage.session.set({capture: {tabId: tab.id, generation}});
-      await chrome.action.setBadgeBackgroundColor({color: '#d93025'});
-      await chrome.action.setBadgeText({text: 'REC'});
-      await chrome.action.setTitle({title: `Recording: ${tab.title || tab.id}\nPaused extensions: ${paused.join(', ') || 'none'}`});
-      await chrome.debugger.sendCommand(next, 'Page.startScreencast', {
-        format: 'jpeg',
-        quality: command.quality,
-        maxWidth: Math.min(command.maxWidth, MAX_CAPTURE_WIDTH),
-        everyNthFrame: 1,
+      await release();
+      await acquire(command.pauseExtensions, current);
+      if (current.paused.length) await reload(chrome, tab.id);
+      const target = {tabId: tab.id};
+      await chrome.debugger.attach(target, '1.3');
+      attached = true;
+      targets.set(tab.id, current);
+      await persist();
+      await chrome.action.setBadgeBackgroundColor({tabId: tab.id, color: '#d93025'});
+      await chrome.action.setBadgeText({tabId: tab.id, text: 'REC'});
+      await chrome.action.setTitle({tabId: tab.id, title: `Recording: ${tab.title || tab.id}\nPaused extensions: ${current.paused.join(', ') || 'none'}`});
+      await chrome.debugger.sendCommand(target, 'Page.startScreencast', {
+        format: 'jpeg', quality: command.quality,
+        maxWidth: Math.min(command.maxWidth, MAX_CAPTURE_WIDTH), everyNthFrame: 1,
       });
       return {tabId: tab.id};
     } catch (error) {
       try {
-        await cleanup();
-      } catch (cleanupError) {
-        logger.error('Capture cleanup failed', cleanupError);
-      }
+        if (attached) await cleanupTarget(current);
+        else await release(current.paused);
+      } catch (cleanupError) { logger.error('Capture cleanup failed', cleanupError); }
       throw toCaptureError(error);
     }
   }
 
   async function dispatch(command) {
-    if (command.type === 'tabs') {
-      return (await chrome.tabs.query({})).map(({id, active, title, url}) => ({id, active, title, url}));
-    }
+    if (command.type === 'tabs') return (await chrome.tabs.query({})).map(({id, active, title, url}) => ({id, active, title, url}));
+    if (command.type === 'start') return startCapture(command);
     if (command.type === 'stop') {
-      await cleanup();
+      const current = [...targets.values()].find(t => t.generation === command.generation);
+      if (current) await cleanupTarget(current);
       return {};
     }
-    if (command.type === 'start') return startCapture(command);
     throw new Error('Unknown extension command');
   }
 
   function onFrame(source, method, params) {
-    if (method !== 'Page.screencastFrame' || source.tabId !== target?.tabId) return;
-    send({
-      type: 'frame', generation, tabId: source.tabId, ack: params.sessionId,
-      ts: params.metadata?.timestamp ?? now(), data: params.data,
-    });
+    const current = targets.get(source.tabId);
+    if (method !== 'Page.screencastFrame' || !current) return;
+    send({type: 'frame', generation: current.generation, tabId: source.tabId, ack: params.sessionId,
+      ts: params.metadata?.timestamp ?? now(), data: params.data});
   }
 
   async function acknowledge(command) {
-    if (command.generation !== generation || !target) return;
-    await chrome.debugger.sendCommand(target, 'Page.screencastFrameAck', {sessionId: command.ack}).catch(() => {});
+    const current = [...targets.values()].find(t => t.generation === command.generation);
+    if (current) await chrome.debugger.sendCommand({tabId: current.tabId}, 'Page.screencastFrameAck', {sessionId: command.ack}).catch(() => {});
   }
 
   async function detached(source, stoppedAt = now()) {
-    if (source.tabId !== target?.tabId) return;
-    target = undefined;
-    generation = undefined;
-    send({type: 'detached', stoppedAt});
-    await chrome.storage.session.remove(CAPTURE_KEY);
-    try {
-      await restoreExtensions(chrome);
-    } finally {
-      await clearIndicator();
-    }
+    const current = targets.get(source.tabId);
+    if (!current || (source.generation !== undefined && source.generation !== current.generation)) return;
+    targets.delete(source.tabId);
+    send({type: 'detached', generation: current.generation, tabId: source.tabId, stoppedAt});
+    await persist();
+    try { await release(current.paused); }
+    finally { await clearIndicator(source.tabId); }
   }
 
-  return {dispatch, cleanup, onFrame, acknowledge, detached};
+  return {dispatch, cleanup, onFrame, acknowledge, detached, generationFor: tabId => targets.get(tabId)?.generation};
 }
