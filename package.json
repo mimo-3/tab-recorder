@@ -1,0 +1,13 @@
+{
+  "name": "tab-recorder",
+  "version": "0.1.0",
+  "description": "Record Chromium tabs through CDP screencast and Native Messaging",
+  "repository": "https://github.com/mimo-3/tab-recorder",
+  "type": "module",
+  "license": "MIT",
+  "os": ["darwin"],
+  "engines": { "node": ">=22" },
+  "bin": { "tab-recorder": "bin/tab-recorder.mjs" },
+  "files": ["bin/", "lib/", "extension/", "README.md", "LICENSE"],
+  "scripts": { "test": "node --test" }
+}
