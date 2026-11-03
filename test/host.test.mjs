@@ -6,12 +6,13 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHost} from '../lib/host.mjs';
 
-async function fixture(t, {startError, writeError, ffmpegFailures = 0} = {}) {
-  const root = await fs.mkdtemp(join(tmpdir(), 'tabrec3-host-'));
+async function fixture(t, {startError, writeError, ffmpegFailures = 0, holdEncode, stopResult} = {}) {
+  const root = await fs.mkdtemp(join(tmpdir(), 'tabrec-fix3-host-'));
   t.after(() => fs.rm(root, {recursive: true, force: true}));
   const sent = [];
   const outputs = [];
   let host;
+  const logs = [];
   const injectedFs = {...fs, writeFile: async (path, ...args) => {
     if (writeError && path.endsWith('.jpg')) throw new Error('disk full');
     return fs.writeFile(path, ...args);
@@ -20,14 +21,15 @@ async function fixture(t, {startError, writeError, ffmpegFailures = 0} = {}) {
     outputs.push(args.at(-1));
     const child = new EventEmitter();
     child.stderr = new EventEmitter();
-    queueMicrotask(() => child.emit('close', ffmpegFailures-- > 0 ? 1 : 0));
+    if (holdEncode && outputs.length === 1) holdEncode((code = 0) => child.emit('close', code));
+    else queueMicrotask(() => child.emit('close', ffmpegFailures-- > 0 ? 1 : 0));
     return child;
   };
   host = createHost({fs: injectedFs, spawn, config: async () => ({pauseExtensions: []}),
-    now: () => 10, log: () => {}, send: value => {
+    now: () => 10, log: value => logs.push(value), send: value => {
       sent.push(value);
       if (value.id) queueMicrotask(() => host.receive({type: 'result', id: value.id,
-        ok: !(value.type === 'start' && startError), error: 'start failed', data: {tabId: 1}}));
+        ok: !(value.type === 'start' && startError), error: 'start failed', data: value.type === 'tabs' ? Array.from({length: 5}, (_, i) => ({id: i + 1, active: i === 0})) : value.type === 'stop' ? stopResult : {tabId: Number(value.tab)}}));
     }});
   t.after(() => host.close());
   const start = (extra = {}) => host.command({command: 'start', options: {tab: 'active', out: join(root, 'recording'), ...extra}});
@@ -36,13 +38,13 @@ async function fixture(t, {startError, writeError, ffmpegFailures = 0} = {}) {
     host.receive({type: 'frame', generation, data: 'aGVsbG8=', ack: 1, ts: 1});
     await host.drain();
   };
-  return {host, root, start, command, frame, sent, outputs};
+  return {host, root, start, command, frame, sent, outputs, logs};
 }
 
 test('failed start removes only the new session directory', async t => {
   const f = await fixture(t, {startError: true});
   await assert.rejects(f.start(), /start failed/);
-  assert.equal((await f.command('status')).session, null);
+  assert.equal((await f.command('status'))[0], undefined);
   await assert.rejects(fs.stat(join(f.root, 'recording')), {code: 'ENOENT'});
   const existing = join(f.root, 'existing');
   await fs.mkdir(existing);
@@ -56,7 +58,7 @@ test('fatal write stop discards session and preserves frames directory', async t
   const started = await f.start();
   await f.frame(started.session);
   await assert.rejects(f.command('stop'), /Frame write failed.*frames retained/);
-  assert.equal((await f.command('status')).session, null);
+  assert.equal((await f.command('status'))[0], undefined);
   assert.equal(f.sent.filter(value => value.type === 'ack').length, 0);
   assert.ok(await fs.stat(started.directory));
 });
@@ -65,7 +67,7 @@ test('zero-frame stop releases session', async t => {
   const f = await fixture(t);
   await f.start();
   await assert.rejects(f.command('stop'), /No frames received.*frames retained/);
-  assert.equal((await f.command('status')).session, null);
+  assert.equal((await f.command('status'))[0], undefined);
 });
 
 test('ffmpeg failure retains session for retry at another output', async t => {
@@ -73,21 +75,21 @@ test('ffmpeg failure retains session for retry at another output', async t => {
   const started = await f.start();
   await f.frame(started.session);
   await assert.rejects(f.command('stop', {output: join(f.root, 'first.mp4')}), /ffmpeg failed/);
-  assert.equal((await f.command('status')).session.id, started.session);
+  assert.equal((await f.command('status'))[0].id, started.session);
   const result = await f.command('stop', {output: join(f.root, 'second.mp4')});
   assert.equal(result.path, join(f.root, 'second.mp4'));
   assert.equal(f.outputs.length, 2);
   assert.equal(f.sent.filter(value => value.type === 'stop').length, 1);
-  assert.equal((await f.command('status')).session, null);
+  assert.equal((await f.command('status'))[0], undefined);
 });
 
 test('generation mismatch is discarded and ack follows metadata write', async t => {
   const f = await fixture(t);
   const started = await f.start();
   await f.frame('old');
-  assert.equal((await f.command('status')).session.frames, 0);
+  assert.equal((await f.command('status'))[0].frames, 0);
   await f.frame(started.session);
-  assert.equal((await f.command('status')).session.frames, 1);
+  assert.equal((await f.command('status'))[0].frames, 1);
   assert.equal(f.sent.filter(value => value.type === 'ack').length, 1);
   const rows = await fs.readFile(join(started.directory, 'frames.jsonl'), 'utf8');
   assert.deepEqual(JSON.parse(rows), {file: 'frames/1.jpg', ts: 1});
@@ -116,11 +118,11 @@ test('record client disconnection automatically stops and encodes', async t => {
   socket.emit('data', JSON.stringify({command: 'record', options: {
     tab: 'active', out: join(f.root, 'recording'), duration: 60,
   }}) + '\n');
-  await waitUntil(async () => (await f.command('status')).session);
-  const s = (await f.command('status')).session;
+  await waitUntil(async () => (await f.command('status'))[0]);
+  const s = (await f.command('status'))[0];
   await f.frame(s.id);
   socket.destroy();
-  await waitUntil(async () => !(await f.command('status')).session);
+  await waitUntil(async () => !(await f.command('status'))[0]);
   assert.equal(f.outputs.length, 1);
   assert.equal(socket.encoding, 'utf8');
   assert.equal(socket.timeout, 0);
@@ -149,8 +151,8 @@ async function beginRecord(f, extra = {}) {
   socket.emit('data', JSON.stringify({command: 'record', options: {
     tab: 'active', out: join(f.root, 'recording'), duration: 60, ...extra,
   }}) + '\n');
-  await waitUntil(async () => (await f.command('status')).session);
-  const s = (await f.command('status')).session;
+  await waitUntil(async () => (await f.command('status'))[0]);
+  const s = (await f.command('status'))[0];
   await f.frame(s.id);
   return socket;
 }
@@ -193,3 +195,158 @@ test('max duration completes waiting record before record duration', async t => 
   assert.equal(socket.response.ok, true);
   assert.equal(f.outputs.length, 1);
 });
+
+test('parallel sessions route frames, require selection and stop independently', async t => {
+  const f = await fixture(t);
+  const a = await f.start();
+  const b = await f.start({tab: '2', out: join(f.root, 'second')});
+  await f.frame(a.session);
+  await f.frame(b.session);
+  assert.deepEqual((await f.command('status')).map(s => [s.tabId, s.frames]), [[1, 1], [2, 1]]);
+  for (const command of ['stop', 'discard']) {
+    await assert.rejects(f.command(command), error => error.message.includes('--session') && error.message.includes(a.session) && error.message.includes(b.session));
+  }
+  await assert.rejects(f.start({out: join(f.root, 'duplicate')}), /already recording/);
+  await f.command('stop', {session: a.session});
+  assert.equal((await f.command('status'))[0].id, b.session);
+  assert.equal(f.sent.filter(s => s.type === 'stop')[0].generation, a.session);
+  await f.command('stop');
+  assert.deepEqual(await f.command('status'), []);
+});
+
+test('four session limit rejects fifth and resumes after discard', async t => {
+  const f = await fixture(t);
+  for (let i = 1; i <= 4; i++) await f.start({tab: String(i), out: join(f.root, String(i))});
+  await assert.rejects(f.start({tab: '5', out: join(f.root, 'five')}), /Maximum 4/);
+  const [first] = await f.command('status');
+  await f.command('discard', {session: first.id});
+  await f.start({tab: '5', out: join(f.root, 'five')});
+  for (const s of await f.command('status')) await f.command('discard', {session: s.id});
+});
+
+test('record disconnect stops only its own session', async t => {
+  const f = await fixture(t);
+  const socket = await beginRecord(f);
+  const other = await f.start({tab: '2', out: join(f.root, 'other')});
+  await f.frame(other.session);
+  socket.destroy();
+  await waitUntil(() => f.outputs.length === 1);
+  await waitUntil(async () => (await f.command('status')).length === 1);
+  assert.equal((await f.command('status'))[0].id, other.session);
+  await f.command('stop');
+});
+
+test('max-duration stops only its own session', async t => {
+  const f = await fixture(t);
+  const timed = await f.start({maxDuration: 0.04});
+  const other = await f.start({tab: '2', out: join(f.root, 'other')});
+  await f.frame(timed.session);
+  await f.frame(other.session);
+  await waitUntil(async () => (await f.command('status')).length === 1);
+  assert.equal((await f.command('status'))[0].id, other.session);
+  await f.command('discard');
+});
+
+for (const action of ['stop', 'discard', 'record-disconnect', 'max-duration']) {
+  test(`slow encoding does not block another session's ${action}, tabs or start`, async t => {
+    let finishEncode;
+    const f = await fixture(t, {holdEncode: done => { finishEncode = done; }});
+    t.after(() => finishEncode?.());
+    let socket;
+    if (action === 'record-disconnect') socket = await beginRecord(f);
+    const a = await f.start({tab: '2', out: join(f.root, 'a')});
+    await f.frame(a.session);
+    const encoding = f.command('stop', {session: a.session});
+    await waitUntil(() => finishEncode);
+    assert.equal((await f.command('tabs')).length, 5);
+    if (socket) {
+      socket.destroy();
+      await waitUntil(async () => (await f.command('status')).every(s => s.id === a.session));
+    } else {
+      const b = await f.start({tab: '3', out: join(f.root, 'b'), ...(action === 'max-duration' ? {maxDuration: 0.03} : {})});
+      await f.frame(b.session);
+      if (action === 'max-duration') await waitUntil(async () => !(await f.command('status')).some(s => s.id === b.session));
+      else await f.command(action, {session: b.session});
+    }
+    assert.ok((await f.command('status')).some(s => s.id === a.session));
+    finishEncode();
+    await encoding;
+  });
+}
+
+test('same-session simultaneous stops and discard wait for one encoding', async t => {
+  let finishEncode;
+  const f = await fixture(t, {holdEncode: done => { finishEncode = done; }});
+  t.after(() => finishEncode?.());
+  const a = await f.start();
+  await f.frame(a.session);
+  const first = f.command('stop');
+  await waitUntil(() => finishEncode);
+  const second = f.command('stop');
+  const discarded = f.command('discard');
+  await f.command('tabs');
+  finishEncode();
+  const results = await Promise.all([first, second, discarded]);
+  assert.deepEqual(results[1], results[0]);
+  assert.deepEqual(results[2], results[0]);
+  assert.equal(f.outputs.length, 1);
+});
+
+test('detach event timestamp determines final frame duration with finite fallback', async t => {
+  for (const [stoppedAt, duration] of [[4, '3'], [Infinity, '9']]) {
+    const f = await fixture(t);
+    const a = await f.start();
+    await f.frame(a.session);
+    f.host.receive({type: 'detached', generation: a.session, stoppedAt});
+    await f.command('stop');
+    assert.match(await fs.readFile(join(a.directory, 'frames.concat'), 'utf8'), new RegExp(`duration ${duration}\\b`));
+  }
+});
+
+test('restore failure warns and continues encoding', async t => {
+  const f = await fixture(t, {stopResult: {restoreFailed: 'Could not restore extensions'}});
+  const a = await f.start();
+  await f.frame(a.session);
+  await f.command('stop');
+  assert.equal(f.outputs.length, 1);
+  assert.match(f.logs.join(' '), /Extension restore failed/);
+});
+
+test('record ffmpeg failure provides exact session retry command', async t => {
+  const f = await fixture(t, {ffmpegFailures: 1});
+  const socket = await beginRecord(f);
+  const [s] = await f.command('status');
+  socket.emit('close');
+  await waitUntil(() => socket.response);
+  assert.equal(socket.response.ok, false);
+  assert.ok(socket.response.error.includes(`stop --session ${s.id} -o`));
+  await f.command('discard', {session: s.id});
+});
+
+for (const trigger of ['disconnect', 'deadline']) {
+  test(`failed manual encoding shares its failure with overlapping ${trigger} and stop`, async t => {
+    let finishEncode;
+    const f = await fixture(t, {holdEncode: done => { finishEncode = done; }});
+    t.after(() => finishEncode?.());
+    const socket = await beginRecord(f, trigger === 'deadline' ? {duration: 0.1} : {});
+    const [s] = await f.command('status');
+    const first = f.command('stop', {output: join(f.root, 'manual.mp4')});
+    const failed = assert.rejects(first, /ffmpeg failed/);
+    await waitUntil(() => finishEncode);
+    const overlapping = f.command('stop', {session: s.id});
+    const sharedFailure = assert.rejects(overlapping, /ffmpeg failed/);
+    if (trigger === 'disconnect') socket.emit('close');
+    else await new Promise(resolve => setTimeout(resolve, 150));
+    await f.command('tabs');
+    finishEncode(1);
+    await Promise.all([failed, sharedFailure]);
+    await waitUntil(() => socket.response);
+    assert.equal(socket.response.ok, false);
+    assert.match(socket.response.error, /ffmpeg failed/);
+    assert.equal(f.outputs.length, 1);
+    assert.equal((await f.command('status'))[0].id, s.id);
+    await f.command('stop', {session: s.id, output: join(f.root, 'retry.mp4')});
+    assert.equal(f.outputs.length, 2);
+    assert.deepEqual(await f.command('status'), []);
+  });
+}

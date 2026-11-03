@@ -21,7 +21,12 @@ const recorder = createRecorder(chrome, send);
 chrome.debugger.onEvent.addListener(recorder.onFrame);
 chrome.debugger.onDetach.addListener(source => {
   const stoppedAt = Date.now() / 1000;
-  queue = queue.then(() => recorder.detached(source, stoppedAt)).catch(console.error);
+  const generation = recorder.generationFor(source.tabId);
+  if (generation === undefined) return;
+  recorder.detached({...source, generation}, stoppedAt, task => {
+    queue = queue.then(task).catch(console.error);
+    return queue;
+  });
 });
 
 function scheduleReconnect() {
