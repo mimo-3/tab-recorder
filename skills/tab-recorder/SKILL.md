@@ -11,7 +11,8 @@ tab-recorder captures one tab through CDP screencast and writes an MP4. It needs
 
 1. `tab-recorder status` must return JSON. An error about the socket or host means the browser is closed or the extension is not loaded. Stop and report it. Do not run `install` or `uninstall` yourself.
 2. `tab-recorder tabs` lists tab IDs, titles and URLs. Pass a numeric ID to `--tab`. Avoid `--tab active` because the active tab changes when someone else switches tabs. A URL substring works only when it matches exactly one tab.
-3. Do not record tabs showing meetings, mail or chat unless the user asked for that tab. The video contains everything the tab shows.
+3. The tab must be painting. A tab that is not visible in any window emits no frames. Tabs opened by an `aside exec` task that has finished often stop painting. Keep the tab active in its window, or hold it open with an `aside repl` session for the length of the recording.
+4. Do not record tabs showing meetings, mail or chat unless the user asked for that tab. The video contains everything the tab shows.
 
 ## Fixed-length recording
 
@@ -51,11 +52,11 @@ tab-recorder stop --session <id> -o /abs/path/demo.mp4
 ffprobe -v error -show_entries format=duration -of csv=p=0 /abs/path/demo.mp4
 ```
 
-Report the path, duration and frame count from `stop` or `record`. A page that does not repaint emits few frames. That is expected and the last frame is held until the end.
+Count frames with `ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 <file>`. Report the path, duration and frame count. A page that does not repaint emits few frames. That is expected and the last frame is held until the end.
 
 ## When it fails
 
-- Attach fails on a page where another extension injects a `chrome-extension://` iframe. Extensions listed in `~/.config/tab-recorder/config.json` are paused during recording to avoid this. Do not edit that file. Report the blocking extension ID to the user.
-- Zero frames: the tab never painted. Check that it is loaded and not discarded, then record again.
+- Attach fails on a page where another extension injects a `chrome-extension://` iframe. Extensions listed in `~/.config/tab-recorder/config.json` are paused during recording to avoid this. Do not edit that file. Report the error message to the user. The error does not name the blocking extension.
+- Zero frames (`No frames received`): the tab never painted. Make it visible as described in "Before recording", then record again.
 - ffmpeg failed: run `stop --session <id> -o <new file>` again, or `tab-recorder encode <frames dir> -o <new file>`.
 - A stale session blocks a tab: check `status`, then `stop` or `discard` it only if you started it.
