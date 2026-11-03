@@ -52,7 +52,7 @@ Pausing extensions reloads the selected tab and can lose page state. It can allo
 
 ## Limits and threat model
 
-- Capture is best effort, not guaranteed 60 fps. Unchanged tabs may emit zero frames. Final still duration is retained.
+- Capture is best effort, not guaranteed 60 fps. Unchanged tabs may emit zero frames. Tabs the browser stops painting, such as a tab hidden behind another tab in its window, emit no frames. Final still duration is retained.
 - Debugger permission displays a browser warning. Protected pages, extension iframes or competing DevTools/debugger sessions can prevent attachment. Unexpected detach stops the capture timeline; stop can encode captured frames.
 - One browser/native host per OS user, with up to four concurrent sessions on distinct tabs. Starting or recording an already reserved tab or exceeding four sessions fails. Stopped sessions retained after encoding failure still count toward the limit until stopped successfully or discarded. Aside and Chrome share the socket. Close the other browser or disable its Tab Recorder extension before switching.
 - The socket directory uses mode 0700 and the socket 0600. Any process running as the same OS user can request recording through the socket. CDP tab capture does not go through macOS Screen Recording permission.
