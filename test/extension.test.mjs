@@ -295,3 +295,50 @@ test('stop-triggered detach does not release shared extension ownership twice', 
   await recorder.dispatch({type: 'stop', generation: 'h'});
   assert.deepEqual(local.paused, []);
 });
+
+for (const immediate of [false, true]) {
+  test(`detach during failed start releases ownership once (immediate=${immediate})`, async () => {
+    const {chrome, local} = mockChrome();
+    chrome.tabs.query = async () => [{id: 1}, {id: 2}];
+    const recorder = createRecorder(chrome, () => {}, {logger: {error() {}}});
+    await recorder.dispatch({...start, tab: '1', pauseExtensions: ['a']});
+    let cleanup;
+    chrome.action.setBadgeText = async ({tabId, text}) => {
+      if (tabId !== 2 || text !== 'REC') return;
+      const pending = recorder.detached({tabId}, 123, task => {
+        if (immediate) return task();
+        cleanup = task;
+      });
+      await pending;
+      throw new Error('tab detached during start');
+    };
+    await assert.rejects(recorder.dispatch({...start, tab: '2', generation: 'h', pauseExtensions: ['a']}), /tab detached/);
+    await cleanup?.();
+    assert.deepEqual(local.paused, ['a']);
+    await recorder.dispatch({type: 'stop', generation: 'g'});
+    assert.deepEqual(local.paused, []);
+  });
+}
+
+test('pending restoration requested by a new capture stays disabled until that capture stops', async () => {
+  const {chrome, local, session} = mockChrome();
+  chrome.tabs.query = async () => [{id: 1}, {id: 2}];
+  local.paused = ['a'];
+  let enabled = false;
+  let failRestore = true;
+  chrome.management.getAll = async () => [{id: 'a', enabled}];
+  chrome.management.setEnabled = async (_id, value) => {
+    if (value && failRestore) throw new Error('temporary restore failure');
+    enabled = value;
+  };
+  const recorder = createRecorder(chrome, () => {}, {logger: {error() {}}});
+  await recorder.dispatch({...start, tab: '1', pauseExtensions: ['a']});
+  failRestore = false;
+  await recorder.dispatch({...start, tab: '2', generation: 'h'});
+  await recorder.dispatch({type: 'stop', generation: 'h'});
+  assert.equal(enabled, false);
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g', paused: ['a']}]);
+  await recorder.dispatch({type: 'stop', generation: 'g'});
+  assert.equal(enabled, true);
+  assert.deepEqual(local.paused, []);
+});

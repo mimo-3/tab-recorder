@@ -69,6 +69,12 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     if (remaining.some(id => !refs.has(id))) throw new Error('Could not restore extensions');
   }
 
+  async function releaseTarget(current) {
+    if (current.released) return;
+    current.released = true;
+    await release(current.paused);
+  }
+
   async function clearIndicator(tabId) {
     for (const clear of [
       () => chrome.action.setBadgeText({tabId, text: ''}),
@@ -95,7 +101,7 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     targets.delete(current.tabId);
     await persist();
     let restoreFailed;
-    try { await release(current.paused); }
+    try { await releaseTarget(current); }
     catch (error) { restoreFailed = error.message; warn('Extension restore failed', error); }
     await clearIndicator(current.tabId);
     return restoreFailed ? {restoreFailed} : {};
@@ -130,8 +136,13 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
         continue;
       }
       const extension = installed.get(id);
-      if (!extension?.enabled || extension.mayDisable === false) continue;
       const {paused = []} = await chrome.storage.local.get('paused');
+      if (extension && paused.includes(id)) {
+        refs.set(id, 1);
+        current.paused.push(id);
+        continue;
+      }
+      if (!extension?.enabled || extension.mayDisable === false) continue;
       await chrome.storage.local.set({paused: [...new Set([...paused, id])]});
       refs.set(id, 1);
       current.paused.push(id);
@@ -166,7 +177,7 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     } catch (error) {
       try {
         if (attached) await cleanupTarget(current);
-        else await release(current.paused);
+        else await releaseTarget(current);
       } catch (cleanupError) { logger.error('Capture cleanup failed', cleanupError); }
       throw toCaptureError(error);
     }
@@ -201,7 +212,7 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     send({type: 'detached', generation: current.generation, tabId: source.tabId, stoppedAt});
     return enqueueCleanup(async () => {
       await persist();
-      try { await release(current.paused); }
+      try { await releaseTarget(current); }
       catch (error) { warn('Extension restore failed', error); }
       await clearIndicator(source.tabId);
     });
