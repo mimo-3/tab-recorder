@@ -68,7 +68,7 @@ test('capture persists target and generation, clamps width and shows REC', async
   const {chrome, calls, session} = mockChrome();
   const recorder = createRecorder(chrome, () => {});
   await recorder.dispatch(start);
-  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g'}]);
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g', paused: []}]);
   assert.ok(calls.some(call => call[0] === 'badge' && call[1] === 'REC'));
   const capture = calls.find(call => call[1] === 'Page.startScreencast');
   assert.equal(capture[2].maxWidth, 3840);
@@ -117,7 +117,7 @@ test('failed detach logs failures and retains capture and REC until retry succee
   chrome.debugger.detach = async () => { throw new Error('temporary debugger error'); };
   chrome.debugger.sendCommand = async () => { throw new Error('stop failed'); };
   await assert.rejects(recorder.cleanup(), /temporary debugger error/);
-  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g'}]);
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g', paused: []}]);
   assert.equal(calls.filter(call => call[0] === 'badge' && call[1] === '').length, 0);
   assert.equal(errors.length, 2);
   chrome.debugger.detach = detach;
@@ -144,7 +144,7 @@ test('start failure remains original even when debugger detach fails', async () 
   const errors = [];
   const recorder = createRecorder(chrome, () => {}, {logger: {error: (...args) => errors.push(args)}});
   await assert.rejects(recorder.dispatch(start), error => error === original);
-  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g'}]);
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'g', paused: []}]);
   assert.equal(errors.length, 3);
 });
 
@@ -164,7 +164,7 @@ test('parallel targets route frames and acknowledgments and keep per-tab indicat
   await recorder.acknowledge({generation: 'h', ack: 2});
   assert.deepEqual(commands.at(-1).target, {tabId: 2});
   await recorder.dispatch({type: 'stop', generation: 'g'});
-  assert.deepEqual(session.capture, [{tabId: 2, generation: 'h'}]);
+  assert.deepEqual(session.capture, [{tabId: 2, generation: 'h', paused: []}]);
   assert.deepEqual(badges, [{tabId: 1, text: 'REC'}, {tabId: 2, text: 'REC'}, {tabId: 1, text: ''}]);
   await recorder.acknowledge({generation: 'g', ack: 1});
   await recorder.detached({tabId: 2});
@@ -179,6 +179,10 @@ test('shared extension pause is restored only after last owner and restart clean
   const recorder = createRecorder(chrome, () => {});
   await recorder.dispatch({...start, tab: '1', pauseExtensions: ['a']});
   await recorder.dispatch({...start, tab: '2', generation: 'h', pauseExtensions: ['a']});
+  assert.deepEqual(session.capture, [
+    {tabId: 1, generation: 'g', paused: ['a']},
+    {tabId: 2, generation: 'h', paused: ['a']},
+  ]);
   assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === false).length, 1);
   await recorder.dispatch({type: 'stop', generation: 'g'});
   assert.deepEqual(local.paused, ['a']);
@@ -202,6 +206,31 @@ test('queued detach from an old generation cannot clear a replacement capture', 
   await recorder.dispatch({type: 'stop', generation: old});
   await recorder.dispatch({...start, generation: 'replacement'});
   await recorder.detached({tabId: 1, generation: old});
-  assert.deepEqual(session.capture, [{tabId: 1, generation: 'replacement'}]);
+  assert.deepEqual(session.capture, [{tabId: 1, generation: 'replacement', paused: []}]);
   await recorder.cleanup();
 });
+
+for (const legacy of [false, true]) {
+  test(`restart retains extension ownership after partial cleanup (legacy=${legacy})`, async () => {
+    const {chrome, session, local, calls} = mockChrome();
+    chrome.tabs.query = async () => [{id: 3}];
+    session.capture = [1, 2].map(tabId => ({tabId, generation: `old${tabId}`,
+      ...(legacy ? {} : {paused: ['a']})}));
+    local.paused = ['a'];
+    chrome.debugger.detach = async ({tabId}) => {
+      if (tabId === 2) throw new Error('temporary detach failure');
+    };
+    const recorder = createRecorder(chrome, () => {}, {logger: {error() {}}});
+    await assert.rejects(recorder.cleanup(), /temporary detach failure/);
+    assert.deepEqual(session.capture, [{tabId: 2, generation: 'old2', paused: ['a']}]);
+    await recorder.dispatch({...start, tab: '3', generation: 'new'});
+    await recorder.dispatch({type: 'stop', generation: 'new'});
+    await assert.rejects(recorder.cleanup(), /temporary detach failure/);
+    assert.deepEqual(local.paused, ['a']);
+    assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === true).length, 0);
+    chrome.debugger.detach = async () => {};
+    await recorder.cleanup();
+    assert.deepEqual(local.paused, []);
+    assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === true).length, 1);
+  });
+}

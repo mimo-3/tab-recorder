@@ -78,7 +78,7 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
   const refs = new Map();
 
   async function persist() {
-    if (targets.size) await chrome.storage.session.set({capture: [...targets.values()].map(({tabId, generation}) => ({tabId, generation}))});
+    if (targets.size) await chrome.storage.session.set({capture: [...targets.values()].map(({tabId, generation, paused}) => ({tabId, generation, paused: [...paused]}))});
     else await chrome.storage.session.remove(CAPTURE_KEY);
   }
 
@@ -106,7 +106,7 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     await chrome.action.setTitle({tabId, title: DEFAULT_TITLE});
   }
 
-  async function cleanupTarget(current, recovering = false) {
+  async function cleanupTarget(current) {
     const target = {tabId: current.tabId};
     try { await chrome.debugger.sendCommand(target, 'Page.stopScreencast'); }
     catch (error) { logger.error('Could not stop screencast during cleanup', error); }
@@ -117,19 +117,24 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     }
     targets.delete(current.tabId);
     await persist();
-    try { if (!recovering) await release(current.paused); }
+    try { await release(current.paused); }
     finally { await clearIndicator(current.tabId); }
   }
 
   async function cleanup() {
     const saved = (await chrome.storage.session.get(CAPTURE_KEY))[CAPTURE_KEY];
+    const {paused = []} = await chrome.storage.local.get('paused');
     for (const entry of (Array.isArray(saved) ? saved : saved ? [saved] : [])) {
-      if (!targets.has(entry.tabId)) targets.set(entry.tabId, entry);
+      if (targets.has(entry.tabId)) continue;
+      // Older records have no ownership information; retain all paused IDs
+      // until every potentially dependent target has been detached.
+      const current = {...entry, paused: [...new Set(entry.paused ?? paused)]};
+      targets.set(entry.tabId, current);
+      for (const id of current.paused) refs.set(id, (refs.get(id) ?? 0) + 1);
     }
-    const recovering = refs.size === 0;
     const errors = [];
     for (const current of [...targets.values()]) {
-      try { await cleanupTarget(current, recovering); } catch (error) { errors.push(error); }
+      try { await cleanupTarget(current); } catch (error) { errors.push(error); }
     }
     if (!targets.size) await release();
     if (errors.length) throw errors[0];
