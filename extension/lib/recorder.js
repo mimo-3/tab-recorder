@@ -22,39 +22,6 @@ export async function selectTab(chrome, selector) {
   return tabs[0];
 }
 
-export async function restoreExtensions(chrome) {
-  const {paused = []} = await chrome.storage.local.get('paused');
-  const installed = new Set((await chrome.management.getAll()).map(extension => extension.id));
-  const remaining = [];
-  for (const id of paused) {
-    if (!installed.has(id)) continue;
-    try {
-      await chrome.management.setEnabled(id, true);
-    } catch {
-      remaining.push(id);
-    }
-  }
-  await chrome.storage.local.set({paused: remaining});
-  if (remaining.length) {
-    throw new Error(`Could not restore extensions: ${remaining.join(', ')}`);
-  }
-}
-
-export async function pauseExtensions(chrome, ids = []) {
-  if (ids.includes(chrome.runtime.id)) throw new Error('Cannot pause Tab Recorder');
-  const installed = new Map((await chrome.management.getAll()).map(extension => [extension.id, extension]));
-  const paused = [];
-  for (const id of new Set(ids)) {
-    const extension = installed.get(id);
-    if (!extension?.enabled || extension.mayDisable === false) continue;
-    paused.push(id);
-    // Persist intent before disabling so a worker restart can restore it.
-    await chrome.storage.local.set({paused: [...paused]});
-    await chrome.management.setEnabled(id, false);
-  }
-  return paused;
-}
-
 function reload(chrome, tabId) {
   return new Promise((resolve, reject) => {
     const finish = error => {
@@ -76,6 +43,7 @@ function reload(chrome, tabId) {
 export function createRecorder(chrome, send, {now = () => Date.now() / 1000, logger = console} = {}) {
   const targets = new Map();
   const refs = new Map();
+  const warn = (...args) => (logger.warn ?? logger.error).call(logger, ...args);
 
   async function persist() {
     if (targets.size) await chrome.storage.session.set({capture: [...targets.values()].map(({tabId, generation, paused}) => ({tabId, generation, paused: [...paused]}))});
@@ -102,23 +70,35 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
   }
 
   async function clearIndicator(tabId) {
-    await chrome.action.setBadgeText({tabId, text: ''});
-    await chrome.action.setTitle({tabId, title: DEFAULT_TITLE});
+    for (const clear of [
+      () => chrome.action.setBadgeText({tabId, text: ''}),
+      () => chrome.action.setTitle({tabId, title: DEFAULT_TITLE}),
+    ]) {
+      try { await clear(); }
+      catch (error) { warn('Could not clear recording indicator', error); }
+    }
   }
 
   async function cleanupTarget(current) {
     const target = {tabId: current.tabId};
+    current.cleaning = true;
     try { await chrome.debugger.sendCommand(target, 'Page.stopScreencast'); }
     catch (error) { logger.error('Could not stop screencast during cleanup', error); }
     try { await chrome.debugger.detach(target); }
     catch (error) {
       logger.error('Could not detach debugger during cleanup', error);
-      if (!/Debugger is not attached to the tab with id:|No tab with (?:given )?id:?/i.test(error.message)) throw error;
+      if (!/Debugger is not attached to the tab with id:|No tab with (?:given )?id:?/i.test(error.message)) {
+        current.cleaning = false;
+        throw error;
+      }
     }
     targets.delete(current.tabId);
     await persist();
+    let restoreFailed;
     try { await release(current.paused); }
-    finally { await clearIndicator(current.tabId); }
+    catch (error) { restoreFailed = error.message; warn('Extension restore failed', error); }
+    await clearIndicator(current.tabId);
+    return restoreFailed ? {restoreFailed} : {};
   }
 
   async function cleanup() {
@@ -167,7 +147,7 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     const current = {tabId: tab.id, generation: command.generation, paused: []};
     let attached = false;
     try {
-      await release();
+      await release().catch(error => warn('Extension restore failed', error));
       await acquire(command.pauseExtensions, current);
       if (current.paused.length) await reload(chrome, tab.id);
       const target = {tabId: tab.id};
@@ -197,8 +177,7 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     if (command.type === 'start') return startCapture(command);
     if (command.type === 'stop') {
       const current = [...targets.values()].find(t => t.generation === command.generation);
-      if (current) await cleanupTarget(current);
-      return {};
+      return current ? cleanupTarget(current) : {};
     }
     throw new Error('Unknown extension command');
   }
@@ -215,14 +194,17 @@ export function createRecorder(chrome, send, {now = () => Date.now() / 1000, log
     if (current) await chrome.debugger.sendCommand({tabId: current.tabId}, 'Page.screencastFrameAck', {sessionId: command.ack}).catch(() => {});
   }
 
-  async function detached(source, stoppedAt = now()) {
+  function detached(source, stoppedAt = now(), enqueueCleanup = task => task()) {
     const current = targets.get(source.tabId);
-    if (!current || (source.generation !== undefined && source.generation !== current.generation)) return;
+    if (!current || current.cleaning || (source.generation !== undefined && source.generation !== current.generation)) return;
     targets.delete(source.tabId);
     send({type: 'detached', generation: current.generation, tabId: source.tabId, stoppedAt});
-    await persist();
-    try { await release(current.paused); }
-    finally { await clearIndicator(source.tabId); }
+    return enqueueCleanup(async () => {
+      await persist();
+      try { await release(current.paused); }
+      catch (error) { warn('Extension restore failed', error); }
+      await clearIndicator(source.tabId);
+    });
   }
 
   return {dispatch, cleanup, onFrame, acknowledge, detached, generationFor: tabId => targets.get(tabId)?.generation};

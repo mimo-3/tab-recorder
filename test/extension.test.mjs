@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createRecorder, pauseExtensions, restoreExtensions} from '../extension/lib/recorder.js';
+import {createRecorder} from '../extension/lib/recorder.js';
 
 function mockChrome() {
   const calls = [];
@@ -23,7 +23,10 @@ function mockChrome() {
       getAll: async () => [{id: 'a', enabled: true}, {id: 'fixed', enabled: true, mayDisable: false}],
       setEnabled: async (id, enabled) => { calls.push(['enabled', id, enabled]); },
     },
-    tabs: {query: async () => [{id: 1, title: 'Example'}]},
+    tabs: {query: async () => [{id: 1, title: 'Example'}],
+      onUpdated: {addListener(fn) { this.listener = fn; }, removeListener() {}},
+      reload: async id => chrome.tabs.onUpdated.listener(id, {status: 'complete'}),
+    },
     debugger: {
       attach: async target => { calls.push(['attach', target]); },
       detach: async target => { calls.push(['detach', target]); },
@@ -40,28 +43,36 @@ function mockChrome() {
 
 const start = {type: 'start', tab: 'active', quality: 80, maxWidth: 5000, pauseExtensions: [], generation: 'g'};
 
-test('pause persists each ID before disabling and ignores missing and protected extensions', async () => {
-  const {chrome, calls} = mockChrome();
-  assert.deepEqual(await pauseExtensions(chrome, ['a', 'gone', 'fixed']), ['a']);
-  assert.deepEqual(calls, [['storage', {paused: ['a']}], ['enabled', 'a', false]]);
-});
-
-test('pause refuses itself before any mutation', async () => {
-  const {chrome, calls} = mockChrome();
-  await assert.rejects(pauseExtensions(chrome, ['a', 'self']), /Cannot pause/);
-  assert.deepEqual(calls, []);
-});
-
-test('restore keeps only installed IDs whose restore failed', async () => {
-  const {chrome, local, calls} = mockChrome();
-  local.paused = ['a', 'fixed', 'gone'];
-  chrome.management.setEnabled = async id => {
-    calls.push(['restore', id]);
-    if (id === 'a') throw new Error('denied');
-  };
-  await assert.rejects(restoreExtensions(chrome), /a/);
+test('acquire persists intent and ignores missing and protected extensions', async () => {
+  const {chrome, calls, local} = mockChrome();
+  const recorder = createRecorder(chrome, () => {});
+  await recorder.dispatch({...start, pauseExtensions: ['a', 'gone', 'fixed']});
   assert.deepEqual(local.paused, ['a']);
-  assert.deepEqual(calls.filter(call => call[0] === 'restore'), [['restore', 'a'], ['restore', 'fixed']]);
+  const disabled = calls.findIndex(c => c[0] === 'enabled' && c[2] === false);
+  assert.ok(calls.findIndex(c => c[0] === 'storage' && c[1].paused.includes('a')) < disabled);
+  await recorder.dispatch({type: 'stop', generation: 'g'});
+  assert.deepEqual(local.paused, []);
+});
+
+test('acquire refuses itself without disabling any extension', async () => {
+  const {chrome, calls} = mockChrome();
+  await assert.rejects(createRecorder(chrome, () => {}).dispatch({...start, pauseExtensions: ['a', 'self']}), /Cannot pause/);
+  assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === false).length, 0);
+});
+
+test('failed restoration does not block start or stop of other targets', async () => {
+  const {chrome, local, session} = mockChrome();
+  local.paused = ['a', 'fixed', 'gone'];
+  chrome.management.setEnabled = async id => { if (id === 'a') throw new Error('denied'); };
+  chrome.tabs.query = async () => [{id: 1}, {id: 2}];
+  const recorder = createRecorder(chrome, () => {}, {logger: {error() {}}});
+  for (const id of [1, 2]) await recorder.dispatch({...start, tab: String(id), generation: String(id)});
+  for (const id of [1, 2]) {
+    const result = await recorder.dispatch({type: 'stop', generation: String(id)});
+    assert.match(result.restoreFailed, /restore/);
+  }
+  assert.deepEqual(local.paused, ['a']);
+  assert.equal(session.capture, undefined);
 });
 
 test('capture persists target and generation, clamps width and shows REC', async () => {
@@ -234,3 +245,53 @@ for (const legacy of [false, true]) {
     assert.equal(calls.filter(c => c[0] === 'enabled' && c[2] === true).length, 1);
   });
 }
+
+test('closed-tab badge and title failures do not fail stop', async () => {
+  const {chrome, session} = mockChrome();
+  const errors = [];
+  const recorder = createRecorder(chrome, () => {}, {logger: {error: (...args) => errors.push(args)}});
+  await recorder.dispatch(start);
+  chrome.action.setBadgeText = async () => { throw new Error('No tab'); };
+  chrome.action.setTitle = async () => { throw new Error('No tab'); };
+  assert.deepEqual(await recorder.dispatch({type: 'stop', generation: 'g'}), {});
+  assert.equal(session.capture, undefined);
+  assert.equal(errors.length, 2);
+});
+
+test('detach notification bypasses queued reload and cleanup retains shared pause ownership', async () => {
+  const {chrome, local} = mockChrome();
+  chrome.tabs.query = async () => [{id: 1}, {id: 2}];
+  const messages = [];
+  const recorder = createRecorder(chrome, v => messages.push(v));
+  await recorder.dispatch({...start, tab: '1', pauseExtensions: ['a']});
+  let reloading;
+  const reloadStarted = new Promise(resolve => { reloading = resolve; });
+  chrome.tabs.reload = async () => reloading();
+  const pendingStart = recorder.dispatch({...start, tab: '2', generation: 'h', pauseExtensions: ['a']});
+  await reloadStarted;
+  let cleanup;
+  recorder.detached({tabId: 1}, 123, task => { cleanup = task; });
+  assert.deepEqual(messages, [{type: 'detached', generation: 'g', tabId: 1, stoppedAt: 123}]);
+  assert.deepEqual(local.paused, ['a']);
+  chrome.tabs.onUpdated.listener(2, {status: 'complete'});
+  await pendingStart;
+  await cleanup();
+  assert.deepEqual(local.paused, ['a']);
+  await recorder.dispatch({type: 'stop', generation: 'h'});
+  assert.deepEqual(local.paused, []);
+});
+
+test('stop-triggered detach does not release shared extension ownership twice', async () => {
+  const {chrome, local} = mockChrome();
+  chrome.tabs.query = async () => [{id: 1}, {id: 2}];
+  const messages = [];
+  const recorder = createRecorder(chrome, v => messages.push(v));
+  chrome.debugger.detach = async source => recorder.detached(source);
+  await recorder.dispatch({...start, tab: '1', pauseExtensions: ['a']});
+  await recorder.dispatch({...start, tab: '2', generation: 'h', pauseExtensions: ['a']});
+  await recorder.dispatch({type: 'stop', generation: 'g'});
+  assert.deepEqual(local.paused, ['a']);
+  assert.deepEqual(messages, []);
+  await recorder.dispatch({type: 'stop', generation: 'h'});
+  assert.deepEqual(local.paused, []);
+});
