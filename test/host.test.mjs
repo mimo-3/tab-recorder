@@ -6,12 +6,13 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHost} from '../lib/host.mjs';
 
-async function fixture(t, {startError, writeError, ffmpegFailures = 0} = {}) {
-  const root = await fs.mkdtemp(join(tmpdir(), 'tabrec-par-host-'));
+async function fixture(t, {startError, writeError, ffmpegFailures = 0, holdEncode, stopResult} = {}) {
+  const root = await fs.mkdtemp(join(tmpdir(), 'tabrec-fix2-host-'));
   t.after(() => fs.rm(root, {recursive: true, force: true}));
   const sent = [];
   const outputs = [];
   let host;
+  const logs = [];
   const injectedFs = {...fs, writeFile: async (path, ...args) => {
     if (writeError && path.endsWith('.jpg')) throw new Error('disk full');
     return fs.writeFile(path, ...args);
@@ -20,14 +21,15 @@ async function fixture(t, {startError, writeError, ffmpegFailures = 0} = {}) {
     outputs.push(args.at(-1));
     const child = new EventEmitter();
     child.stderr = new EventEmitter();
-    queueMicrotask(() => child.emit('close', ffmpegFailures-- > 0 ? 1 : 0));
+    if (holdEncode && outputs.length === 1) holdEncode(() => child.emit('close', 0));
+    else queueMicrotask(() => child.emit('close', ffmpegFailures-- > 0 ? 1 : 0));
     return child;
   };
   host = createHost({fs: injectedFs, spawn, config: async () => ({pauseExtensions: []}),
-    now: () => 10, log: () => {}, send: value => {
+    now: () => 10, log: value => logs.push(value), send: value => {
       sent.push(value);
       if (value.id) queueMicrotask(() => host.receive({type: 'result', id: value.id,
-        ok: !(value.type === 'start' && startError), error: 'start failed', data: value.type === 'tabs' ? Array.from({length: 5}, (_, i) => ({id: i + 1, active: i === 0})) : {tabId: Number(value.tab)}}));
+        ok: !(value.type === 'start' && startError), error: 'start failed', data: value.type === 'tabs' ? Array.from({length: 5}, (_, i) => ({id: i + 1, active: i === 0})) : value.type === 'stop' ? stopResult : {tabId: Number(value.tab)}}));
     }});
   t.after(() => host.close());
   const start = (extra = {}) => host.command({command: 'start', options: {tab: 'active', out: join(root, 'recording'), ...extra}});
@@ -36,7 +38,7 @@ async function fixture(t, {startError, writeError, ffmpegFailures = 0} = {}) {
     host.receive({type: 'frame', generation, data: 'aGVsbG8=', ack: 1, ts: 1});
     await host.drain();
   };
-  return {host, root, start, command, frame, sent, outputs};
+  return {host, root, start, command, frame, sent, outputs, logs};
 }
 
 test('failed start removes only the new session directory', async t => {
@@ -243,4 +245,80 @@ test('max-duration stops only its own session', async t => {
   await waitUntil(async () => (await f.command('status')).length === 1);
   assert.equal((await f.command('status'))[0].id, other.session);
   await f.command('discard');
+});
+
+for (const action of ['stop', 'discard', 'record-disconnect', 'max-duration']) {
+  test(`slow encoding does not block another session's ${action}, tabs or start`, async t => {
+    let finishEncode;
+    const f = await fixture(t, {holdEncode: done => { finishEncode = done; }});
+    t.after(() => finishEncode?.());
+    let socket;
+    if (action === 'record-disconnect') socket = await beginRecord(f);
+    const a = await f.start({tab: '2', out: join(f.root, 'a')});
+    await f.frame(a.session);
+    const encoding = f.command('stop', {session: a.session});
+    await waitUntil(() => finishEncode);
+    assert.equal((await f.command('tabs')).length, 5);
+    if (socket) {
+      socket.destroy();
+      await waitUntil(async () => (await f.command('status')).every(s => s.id === a.session));
+    } else {
+      const b = await f.start({tab: '3', out: join(f.root, 'b'), ...(action === 'max-duration' ? {maxDuration: 0.03} : {})});
+      await f.frame(b.session);
+      if (action === 'max-duration') await waitUntil(async () => !(await f.command('status')).some(s => s.id === b.session));
+      else await f.command(action, {session: b.session});
+    }
+    assert.ok((await f.command('status')).some(s => s.id === a.session));
+    finishEncode();
+    await encoding;
+  });
+}
+
+test('same-session simultaneous stops and discard wait for one encoding', async t => {
+  let finishEncode;
+  const f = await fixture(t, {holdEncode: done => { finishEncode = done; }});
+  t.after(() => finishEncode?.());
+  const a = await f.start();
+  await f.frame(a.session);
+  const first = f.command('stop');
+  await waitUntil(() => finishEncode);
+  const second = f.command('stop');
+  const discarded = f.command('discard');
+  await f.command('tabs');
+  finishEncode();
+  const results = await Promise.all([first, second, discarded]);
+  assert.deepEqual(results[1], results[0]);
+  assert.deepEqual(results[2], results[0]);
+  assert.equal(f.outputs.length, 1);
+});
+
+test('detach event timestamp determines final frame duration with finite fallback', async t => {
+  for (const [stoppedAt, duration] of [[4, '3'], [Infinity, '9']]) {
+    const f = await fixture(t);
+    const a = await f.start();
+    await f.frame(a.session);
+    f.host.receive({type: 'detached', generation: a.session, stoppedAt});
+    await f.command('stop');
+    assert.match(await fs.readFile(join(a.directory, 'frames.concat'), 'utf8'), new RegExp(`duration ${duration}\\b`));
+  }
+});
+
+test('restore failure warns and continues encoding', async t => {
+  const f = await fixture(t, {stopResult: {restoreFailed: 'Could not restore extensions'}});
+  const a = await f.start();
+  await f.frame(a.session);
+  await f.command('stop');
+  assert.equal(f.outputs.length, 1);
+  assert.match(f.logs.join(' '), /Extension restore failed/);
+});
+
+test('record ffmpeg failure provides exact session retry command', async t => {
+  const f = await fixture(t, {ffmpegFailures: 1});
+  const socket = await beginRecord(f);
+  const [s] = await f.command('status');
+  socket.emit('close');
+  await waitUntil(() => socket.response);
+  assert.equal(socket.response.ok, false);
+  assert.ok(socket.response.error.includes(`stop --session ${s.id} -o`));
+  await f.command('discard', {session: s.id});
 });
