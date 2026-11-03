@@ -7,7 +7,7 @@ import {tmpdir} from 'node:os';
 import {createHost} from '../lib/host.mjs';
 
 async function fixture(t, {startError, writeError, ffmpegFailures = 0, holdEncode, stopResult} = {}) {
-  const root = await fs.mkdtemp(join(tmpdir(), 'tabrec-fix2-host-'));
+  const root = await fs.mkdtemp(join(tmpdir(), 'tabrec-fix3-host-'));
   t.after(() => fs.rm(root, {recursive: true, force: true}));
   const sent = [];
   const outputs = [];
@@ -21,7 +21,7 @@ async function fixture(t, {startError, writeError, ffmpegFailures = 0, holdEncod
     outputs.push(args.at(-1));
     const child = new EventEmitter();
     child.stderr = new EventEmitter();
-    if (holdEncode && outputs.length === 1) holdEncode(() => child.emit('close', 0));
+    if (holdEncode && outputs.length === 1) holdEncode((code = 0) => child.emit('close', code));
     else queueMicrotask(() => child.emit('close', ffmpegFailures-- > 0 ? 1 : 0));
     return child;
   };
@@ -322,3 +322,31 @@ test('record ffmpeg failure provides exact session retry command', async t => {
   assert.ok(socket.response.error.includes(`stop --session ${s.id} -o`));
   await f.command('discard', {session: s.id});
 });
+
+for (const trigger of ['disconnect', 'deadline']) {
+  test(`failed manual encoding shares its failure with overlapping ${trigger} and stop`, async t => {
+    let finishEncode;
+    const f = await fixture(t, {holdEncode: done => { finishEncode = done; }});
+    t.after(() => finishEncode?.());
+    const socket = await beginRecord(f, trigger === 'deadline' ? {duration: 0.1} : {});
+    const [s] = await f.command('status');
+    const first = f.command('stop', {output: join(f.root, 'manual.mp4')});
+    const failed = assert.rejects(first, /ffmpeg failed/);
+    await waitUntil(() => finishEncode);
+    const overlapping = f.command('stop', {session: s.id});
+    const sharedFailure = assert.rejects(overlapping, /ffmpeg failed/);
+    if (trigger === 'disconnect') socket.emit('close');
+    else await new Promise(resolve => setTimeout(resolve, 150));
+    await f.command('tabs');
+    finishEncode(1);
+    await Promise.all([failed, sharedFailure]);
+    await waitUntil(() => socket.response);
+    assert.equal(socket.response.ok, false);
+    assert.match(socket.response.error, /ffmpeg failed/);
+    assert.equal(f.outputs.length, 1);
+    assert.equal((await f.command('status'))[0].id, s.id);
+    await f.command('stop', {session: s.id, output: join(f.root, 'retry.mp4')});
+    assert.equal(f.outputs.length, 2);
+    assert.deepEqual(await f.command('status'), []);
+  });
+}
