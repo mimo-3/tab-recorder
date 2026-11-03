@@ -23,7 +23,10 @@ chrome.debugger.onDetach.addListener(source => {
   const stoppedAt = Date.now() / 1000;
   const generation = recorder.generationFor(source.tabId);
   if (generation === undefined) return;
-  queue = queue.then(() => recorder.detached({...source, generation}, stoppedAt)).catch(console.error);
+  recorder.detached({...source, generation}, stoppedAt, task => {
+    queue = queue.then(task).catch(console.error);
+    return queue;
+  });
 });
 
 function scheduleReconnect() {

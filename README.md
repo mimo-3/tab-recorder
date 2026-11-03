@@ -59,3 +59,7 @@ Pausing extensions reloads the selected tab and can lose page state. It can allo
 - Native Messaging `allowed_origins` restricts the extension ID allowed to connect; it does not protect against a modified extension using that ID. The host permits pausing only IDs in the config allowlist. No remote API is provided.
 
 Run `node --test`. Real browser capture, extension restoration, worker restart and ffmpeg output require target-machine verification.
+
+If paused extensions cannot be restored, stopping still encodes the recording and
+logs an extension restoration warning (`restoreFailed` in the extension result).
+Failed IDs remain saved for a later restoration attempt.
