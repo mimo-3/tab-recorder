@@ -38,7 +38,7 @@ tab-recorder stop --session <id> -o /abs/path/demo.mp4
 
 - Up to 4 sessions can run at the same time, one per tab. Recording the same tab twice is rejected.
 - Start each `record` as its own background command. A `record` that ends or is killed stops only its own session.
-- With two or more sessions active, `stop` and `discard` require `--session <id>`. `status` lists every session.
+- Always pass `--session <id>` to `stop` and `discard`, even when only one session is active. Without it, the command acts on whatever single session exists, which may belong to another agent. With two or more sessions active, the flag is required. `status` lists every session.
 
 ## Paths
 
@@ -58,5 +58,5 @@ Count frames with `ffprobe -v error -count_frames -select_streams v -show_entrie
 
 - Attach fails on a page where another extension injects a `chrome-extension://` iframe. Extensions listed in `~/.config/tab-recorder/config.json` are paused during recording to avoid this. Do not edit that file. Report the error message to the user. The error does not name the blocking extension.
 - Zero frames (`No frames received`): the tab never painted. Make it visible as described in "Before recording", then record again.
-- ffmpeg failed: run `stop --session <id> -o <new file>` again, or `tab-recorder encode <frames dir> -o <new file>`.
+- ffmpeg failed: the error names the session ID. Run `stop --session <id> -o <new file>` again, or `tab-recorder encode <frames dir> -o <new file>`.
 - A stale session blocks a tab: check `status`, then `stop` or `discard` it only if you started it.
