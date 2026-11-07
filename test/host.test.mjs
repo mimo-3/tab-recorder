@@ -4,7 +4,7 @@ import {EventEmitter} from 'node:events';
 import * as fs from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {createHost} from '../lib/host.mjs';
+import {createHost, PROFILE_RETRY_S} from '../lib/host.mjs';
 
 async function fixture(t, {startError, writeError, ffmpegFailures = 0, holdEncode, stopResult} = {}) {
   const root = await fs.mkdtemp(join(tmpdir(), 'tabrec-fix3-host-'));
@@ -358,10 +358,12 @@ async function helloHost(t, overrides = {}) {
   const root = await fs.mkdtemp('/tmp/tabrec-prof-');
   t.after(() => fs.rm(root, {recursive: true, force: true}));
   const events = [];
-  let resolves = 0;
+  const logs = [];
+  const clock = {now: 100};
+  const lookups = {count: 0};
   const host = createHost({
-    hostsDir: join(root, 'hosts'), log: () => {}, send: () => {},
-    resolveProfile: async id => (++resolves > 1 ? {browser: 'aside', profileDir: 'Profile 2', profileName: `Work ${id.slice(0, 4)}`} : null),
+    hostsDir: join(root, 'hosts'), log: value => logs.push(value), send: () => {}, now: () => clock.now,
+    resolveProfile: async id => (++lookups.count > 1 ? {browser: 'aside', profileDir: 'Profile 2', profileName: `Work ${id.slice(0, 4)}`} : null),
     onListening: path => events.push(['listening', path]),
     onFatal: error => events.push(['fatal', error.message]),
     ...overrides,
@@ -371,10 +373,10 @@ async function helloHost(t, overrides = {}) {
     const check = () => events.length ? resolve(events) : setTimeout(check, 5);
     check();
   });
-  return {host, root, events, settled};
+  return {host, root, events, logs, clock, lookups, settled};
 }
 
-test('hello opens a private per-instance socket and status re-resolves the profile', async t => {
+test('hello opens a private per-instance socket and profile lookups are throttled then cached', async t => {
   const f = await helloHost(t);
   assert.equal((await f.host.command({command: 'status', options: {}})).host.instanceId, undefined);
   f.host.receive({type: 'hello', instanceId: INSTANCE});
@@ -384,8 +386,15 @@ test('hello opens a private per-instance socket and status re-resolves the profi
   assert.equal((await fs.stat(join(f.root, 'hosts'))).mode & 0o777, 0o700);
   const first = await f.host.command({command: 'status', options: {}});
   assert.deepEqual(first, {host: {instanceId: INSTANCE, browser: null, profileDir: null, profileName: null}, sessions: []});
+  f.clock.now += PROFILE_RETRY_S - 1;
+  assert.equal((await f.host.command({command: 'status', options: {}})).host.profileName, null);
+  assert.equal(f.lookups.count, 1);
+  f.clock.now += 1;
   const second = await f.host.command({command: 'status', options: {}});
   assert.deepEqual(second.host, {instanceId: INSTANCE, browser: 'aside', profileDir: 'Profile 2', profileName: 'Work abcd'});
+  f.clock.now += 1000;
+  await f.host.command({command: 'status', options: {}});
+  assert.equal(f.lookups.count, 2);
   f.host.receive({type: 'hello', instanceId: '00000000-0000-4000-8000-000000000000'});
   assert.equal(f.host.socketPath(), path);
   await f.host.close();
@@ -410,4 +419,11 @@ test('a live host for the same profile is kept and the newcomer fails without to
   assert.deepEqual(await second.settled(), [['fatal', 'Another native host already serves this browser profile']]);
   await second.host.close();
   assert.ok((await fs.lstat(join(first.root, 'hosts', `${INSTANCE}.sock`))).isSocket());
+});
+
+test('close reports sessions that were still running', async t => {
+  const f = await fixture(t);
+  const started = await f.start();
+  await f.host.close();
+  assert.ok(f.logs.some(line => line.includes(`active session ${started.session}`) && line.includes(started.directory)));
 });
