@@ -4,6 +4,7 @@ import {createConnection, ensureReconnectAlarm, RECONNECT_ALARM} from './lib/con
 // Keep in sync with HOST_NAME in lib/core.mjs.
 const HOST_NAME = 'com.mimo3.tab_recorder';
 let queue = Promise.resolve();
+let cleanupDone = Promise.resolve();
 
 const connection = createConnection(chrome, {
   hostName: HOST_NAME,
@@ -21,9 +22,8 @@ const connection = createConnection(chrome, {
       }
     });
   },
-  onDisconnect: () => {
-    queue = queue.then(recorder.cleanup).catch(console.error);
-  },
+  onDisconnect: cleanup,
+  ready: () => cleanupDone,
 });
 
 const recorder = createRecorder(chrome, connection.send);
@@ -38,14 +38,19 @@ chrome.debugger.onDetach.addListener(source => {
   });
 });
 
+// Cleanup stays ordered after queued commands; connect waits for it with a time limit.
+function cleanup() {
+  cleanupDone = queue = queue.then(recorder.cleanup).catch(console.error);
+}
+
 function initialize() {
-  queue = queue.then(recorder.cleanup).catch(console.error);
-  void queue.then(connection.connect);
+  cleanup();
+  void connection.connect();
 }
 
 // Listeners must be registered synchronously so alarm wake-ups reach this worker.
 chrome.alarms.onAlarm.addListener(alarm => {
-  if (alarm.name === RECONNECT_ALARM) void queue.then(connection.connect);
+  if (alarm.name === RECONNECT_ALARM) void connection.connect();
 });
 chrome.runtime.onStartup.addListener(initialize);
 chrome.runtime.onInstalled.addListener(initialize);
