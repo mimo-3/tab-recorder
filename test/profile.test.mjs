@@ -14,12 +14,13 @@ async function support(t) {
   return dir;
 }
 
-async function profile(root, browser, name, {files = {}, preferences} = {}) {
+async function profile(root, browser, name, {files = {}, preferences, localState} = {}) {
   const dir = join(root, browser, name);
   const storage = join(dir, 'Local Extension Settings', EXTENSION);
   await mkdir(storage, {recursive: true});
   for (const [file, content] of Object.entries(files)) await writeFile(join(storage, file), content);
   if (preferences !== undefined) await writeFile(join(dir, 'Preferences'), preferences);
+  if (localState !== undefined) await writeFile(join(root, browser, 'Local State'), localState);
 }
 
 test('profile is found by the instance ID in extension LevelDB files', async t => {
@@ -41,4 +42,20 @@ test('unflushed storage, missing browsers and broken Preferences are tolerated',
   await profile(root, 'Aside', 'Profile 1', {files: {'000007.log': INSTANCE}, preferences: '{broken'});
   assert.deepEqual(await resolveProfile(INSTANCE, {supportDir: root, extensionId: EXTENSION}),
     {browser: 'aside', profileDir: 'Profile 1', profileName: null});
+});
+
+test('Local State name wins over Preferences, which is the fallback', async t => {
+  const root = await support(t);
+  const state = JSON.stringify({profile: {info_cache: {'Profile 1': {name: 'sotto'}}}});
+  await profile(root, 'Aside', 'Profile 1', {files: {'000003.log': INSTANCE}, preferences: '{"profile":{"name":"stale"}}', localState: state});
+  assert.deepEqual(await resolveProfile(INSTANCE, {supportDir: root, extensionId: EXTENSION}),
+    {browser: 'aside', profileDir: 'Profile 1', profileName: 'sotto'});
+
+  const root2 = await support(t);
+  await profile(root2, 'Aside', 'Profile 2', {files: {'000003.log': INSTANCE}, preferences: '{"profile":{"name":"Prefs"}}', localState: '{"profile":{"info_cache":{}}}'});
+  assert.equal((await resolveProfile(INSTANCE, {supportDir: root2, extensionId: EXTENSION})).profileName, 'Prefs');
+
+  const root3 = await support(t);
+  await profile(root3, 'Aside', 'Profile 2', {files: {'000003.log': INSTANCE}, localState: 'not json'});
+  assert.equal((await resolveProfile(INSTANCE, {supportDir: root3, extensionId: EXTENSION})).profileName, null);
 });
