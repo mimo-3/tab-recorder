@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, symlink, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, symlink, realpath, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Duplex } from 'node:stream';
 import { findFfmpeg, request, main } from '../bin/tab-recorder.mjs';
 
 async function temporary(t) {
-  const dir = await mkdtemp(join(tmpdir(), 'tabrec3-cli-'));
+  const dir = await mkdtemp(join(tmpdir(), 'tabrec-prof-cli-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   return dir;
 }
@@ -56,4 +56,141 @@ test('offline encode runs without native host and preserves existing concat safe
   await writeFile(ffmpeg, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
   const output = join(dir, 'out.mp4');
   assert.deepEqual(await main(['encode', dir, '--ffmpeg', ffmpeg, '-o', output]), { path: output });
+});
+
+const ID_A = '11111111-1111-4111-8111-111111111111';
+const ID_B = '22222222-2222-4222-8222-222222222222';
+const ID_BROKEN = '33333333-3333-4333-8333-333333333333';
+const ID_GONE = '44444444-4444-4444-8444-444444444444';
+
+// Fake per-profile hosts keyed by socket path; records each request it serves.
+function fakeHosts(dir, hosts) {
+  const calls = [];
+  const connect = path => {
+    const id = path.slice(dir.length + 1, -'.sock'.length);
+    const socket = new Duplex({
+      read() {},
+      write(chunk, _encoding, callback) {
+        const req = JSON.parse(chunk.toString());
+        calls.push([id, req.command, req.options]);
+        const data = hosts[id].handle(req);
+        const response = data?.fail ? { ok: false, error: data.fail } : { ok: true, data };
+        socket.push(JSON.stringify(response) + '\n');
+        socket.push(null);
+        callback();
+      },
+    });
+    socket.setTimeout = () => {};
+    queueMicrotask(() => {
+      const error = hosts[id]?.error;
+      if (error) socket.emit('error', Object.assign(new Error(error), { code: error }));
+      else socket.emit('connect');
+    });
+    return socket;
+  };
+  return { connect, calls };
+}
+
+function profileHost(id, { name, dir, tabs = [], sessions = [], tabsFail }) {
+  const host = { instanceId: id, browser: 'aside', profileDir: dir, profileName: name };
+  return {
+    handle(req) {
+      if (req.command === 'status') return { host, sessions };
+      if (req.command === 'tabs') return tabsFail ? { fail: tabsFail } : { host, tabs };
+      return { routed: id, command: req.command, options: req.options };
+    },
+  };
+}
+
+async function hostsFixture(t) {
+  const dir = await temporary(t);
+  const hosts = {
+    [ID_A]: profileHost(ID_A, { name: 'Work', dir: 'Default', tabs: [{ id: 1 }, { id: 2 }], sessions: [{ id: 'sa', tabId: 1 }] }),
+    [ID_B]: profileHost(ID_B, { name: 'Personal', dir: 'Profile 1', tabs: [{ id: 7 }], sessions: [{ id: 'sb', tabId: 7 }] }),
+    [ID_GONE]: { error: 'ENOENT' },
+  };
+  for (const id of [ID_A, ID_B, ID_GONE]) await writeFile(join(dir, `${id}.sock`), '');
+  await writeFile(join(dir, 'not-a-host.sock'), '');
+  const fake = fakeHosts(dir, hosts);
+  return { dir, hosts, ...fake, warnings: [], run(argv) { return main(argv, { dir, connect: fake.connect, config: async () => ({ pauseExtensions: [] }), warn: message => this.warnings.push(message) }); } };
+}
+
+test('status and tabs aggregate every live profile and tag each row', async t => {
+  const f = await hostsFixture(t);
+  const status = await f.run(['status']);
+  assert.deepEqual(status.map(s => [s.id, s.profile.profileName, s.profile.instanceId]), [['sa', 'Work', ID_A], ['sb', 'Personal', ID_B]]);
+  const tabs = await f.run(['tabs']);
+  assert.deepEqual(tabs.map(tab => [tab.id, tab.profile.profileDir]), [[1, 'Default'], [2, 'Default'], [7, 'Profile 1']]);
+  assert.deepEqual((await f.run(['tabs', '--profile', 'Personal'])).map(tab => tab.id), [7]);
+  assert.ok(!f.calls.some(([id]) => id === 'not-a-host'));
+});
+
+test('--profile matches name, directory or instance ID prefix', async t => {
+  const f = await hostsFixture(t);
+  assert.equal((await f.run(['start', '--tab', 'active', '--profile', 'Work'])).routed, ID_A);
+  assert.equal((await f.run(['start', '--tab', 'active', '--profile', 'Profile 1'])).routed, ID_B);
+  assert.equal((await f.run(['start', '--tab', 'active', '--profile', '2222'])).routed, ID_B);
+  await assert.rejects(f.run(['start', '--tab', 'active', '--profile', 'Nope']), /No connected profile matches --profile Nope/);
+  const sent = f.calls.find(([, command]) => command === 'start')[2];
+  assert.equal(sent.profile, undefined);
+});
+
+test('start picks the profile that owns a numeric tab and rejects ambiguity', async t => {
+  const f = await hostsFixture(t);
+  assert.equal((await f.run(['start', '--tab', '7'])).routed, ID_B);
+  assert.equal((await f.run(['record', '--tab', '2', '--duration', '1'])).routed, ID_A);
+  await assert.rejects(f.run(['start', '--tab', 'active']), /matches 2 browser profiles; pass --profile/);
+  await assert.rejects(f.run(['start', '--tab', '99']), /not found in any connected profile/);
+  f.hosts[ID_B] = profileHost(ID_B, { name: 'Personal', dir: 'Profile 1', tabs: [{ id: 1 }] });
+  await assert.rejects(f.run(['start', '--tab', '1']), /--tab 1 matches 2 browser profiles/);
+});
+
+test('stop and discard route by session ID across profiles', async t => {
+  const f = await hostsFixture(t);
+  assert.equal((await f.run(['stop', '--session', 'sb'])).routed, ID_B);
+  assert.equal((await f.run(['discard', '--session', 'sa'])).routed, ID_A);
+  await assert.rejects(f.run(['stop', '--session', 'missing']), /Session ID does not match/);
+  await assert.rejects(f.run(['stop']), /--session is required/);
+  assert.equal((await f.run(['stop', '--profile', 'Work'])).routed, ID_A);
+});
+
+test('single profile keeps the old behavior and zero profiles explain the fix', async t => {
+  const f = await hostsFixture(t);
+  f.hosts[ID_B] = { error: 'ENOENT' };
+  assert.equal((await f.run(['start', '--tab', 'active'])).routed, ID_A);
+  assert.equal((await f.run(['stop'])).routed, ID_A);
+  f.hosts[ID_A] = { error: 'ENOENT' };
+  await assert.rejects(f.run(['status']), /Native host unavailable: no browser profile is connected/);
+  const empty = await temporary(t);
+  await assert.rejects(main(['status'], { dir: join(empty, 'missing') }), /Native host unavailable/);
+});
+
+test('dead sockets are skipped and never removed by the CLI', async t => {
+  const f = await hostsFixture(t);
+  f.hosts[ID_B] = { error: 'ECONNREFUSED' };
+  assert.deepEqual((await f.run(['status'])).map(s => s.id), ['sa']);
+  assert.equal(await readFile(join(f.dir, `${ID_B}.sock`), 'utf8'), '');
+  assert.equal(await readFile(join(f.dir, `${ID_GONE}.sock`), 'utf8'), '');
+  assert.deepEqual(f.warnings, []);
+});
+
+test('a failing host is skipped with a warning unless --profile names it', async t => {
+  const f = await hostsFixture(t);
+  await writeFile(join(f.dir, `${ID_BROKEN}.sock`), '');
+  f.hosts[ID_BROKEN] = { error: 'ETIMEDOUT' };
+  assert.deepEqual((await f.run(['status'])).map(s => s.id), ['sa', 'sb']);
+  assert.match(f.warnings[0], new RegExp(`Skipping native host ${ID_BROKEN}`));
+  await assert.rejects(f.run(['status', '--profile', '3333']), new RegExp(`Native host ${ID_BROKEN} failed`));
+  f.hosts[ID_B] = profileHost(ID_B, { name: 'Personal', dir: 'Profile 1', tabsFail: 'Response too large' });
+  assert.deepEqual((await f.run(['tabs'])).map(tab => tab.id), [1, 2]);
+  assert.ok(f.warnings.some(message => message.includes('Response too large')));
+  assert.equal((await f.run(['start', '--tab', '2'])).routed, ID_A);
+  await assert.rejects(f.run(['tabs', '--profile', 'Personal']), /Response too large/);
+});
+
+test('numeric --tab picks the owner among several hosts matching --profile', async t => {
+  const f = await hostsFixture(t);
+  f.hosts[ID_B] = profileHost(ID_B, { name: 'Work', dir: 'Profile 1', tabs: [{ id: 7 }] });
+  assert.equal((await f.run(['start', '--tab', '7', '--profile', 'Work'])).routed, ID_B);
+  await assert.rejects(f.run(['start', '--tab', 'active', '--profile', 'Work']), /--profile Work matches 2 browser profiles/);
 });

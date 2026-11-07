@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import net from 'node:net';
-import { mkdir, writeFile, unlink, access, realpath, stat } from 'node:fs/promises';
+import { mkdir, writeFile, unlink, access, realpath, stat, readdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseArgs, loadConfig, authorizePause, appDir, socketPath, hostName, quote } from '../lib/core.mjs';
+import { parseArgs, loadConfig, authorizePause, appDir, hostsDir, hostName, quote, INSTANCE_ID_PATTERN, SOCKET_NAME_PATTERN } from '../lib/core.mjs';
 import { extensionId } from '../lib/extension-id.mjs';
 import { encodeRecording } from '../lib/encode.mjs';
 
@@ -62,7 +62,7 @@ function ignoreMissing(error) {
   if (error.code !== 'ENOENT') throw error;
 }
 
-export function request(command, options, path = socketPath, connect = net.createConnection) {
+export function request(command, options, path, connect = net.createConnection) {
   return new Promise((resolve, reject) => {
     const socket = connect(path);
     socket.setEncoding('utf8');
@@ -75,7 +75,7 @@ export function request(command, options, path = socketPath, connect = net.creat
     };
     socket.setTimeout(['stop', 'record'].includes(command) ? 0 : REQUEST_TIMEOUT_MS, () => fail(new Error('Native host timed out')));
     socket.on('connect', () => socket.write(JSON.stringify({ command, options }) + '\n'));
-    socket.on('error', error => fail(new Error(`Native host unavailable: ${error.message}. Load the extension and run tab-recorder install.`)));
+    socket.on('error', error => fail(Object.assign(new Error(`Native host unavailable: ${error.message}. Load the extension and run tab-recorder install.`), { code: error.code })));
     socket.on('data', chunk => {
       buffer += chunk;
       if (buffer.length > RESPONSE_LIMIT) return fail(new Error('Response too large'));
@@ -92,16 +92,111 @@ export function request(command, options, path = socketPath, connect = net.creat
   });
 }
 
-export async function main(argv) {
+const UNAVAILABLE = 'Native host unavailable: no browser profile is connected. Open Aside or Chrome with the extension loaded and run tab-recorder install.';
+
+// Ask every per-profile socket for its status. Never unlink here: a new host for the
+// same instance may be rebinding the path, and host listen() already removes stale sockets.
+export async function discoverHosts({ dir = hostsDir, connect } = {}) {
+  let names;
+  try { names = await readdir(dir); }
+  catch (error) { if (error.code === 'ENOENT') return { hosts: [], failed: [] }; throw error; }
+  const ids = names.map(name => SOCKET_NAME_PATTERN.exec(name)?.[1])
+    .filter(id => id && INSTANCE_ID_PATTERN.test(id)).sort();
+  const results = await Promise.allSettled(ids.map(async id => {
+    const path = join(dir, `${id}.sock`);
+    const { host, sessions } = await request('status', {}, path, connect);
+    return { path, host: { ...host, instanceId: id }, sessions };
+  }));
+  const hosts = [], failed = [];
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') hosts.push(result.value);
+    else if (!['ECONNREFUSED', 'ENOENT'].includes(result.reason.code)) failed.push({ instanceId: ids[index], error: result.reason });
+  });
+  return { hosts, failed };
+}
+
+function warnFailures(failed, warn) {
+  for (const { instanceId, error } of failed) warn(`Skipping native host ${instanceId}: ${error.message}`);
+}
+
+export function matchesProfile(host, value) {
+  return host.profileName === value || host.profileDir === value || host.instanceId.startsWith(value.toLowerCase());
+}
+
+function describe(hosts) {
+  return hosts.map(({ host }) => `${host.browser ?? 'unknown'}/${host.profileDir ?? '?'} "${host.profileName ?? '?'}" ${host.instanceId}`).join(', ');
+}
+
+function filterHosts({ hosts, failed }, profile, warn) {
+  const explicit = profile ? failed.filter(entry => entry.instanceId.startsWith(profile.toLowerCase())) : [];
+  if (explicit.length) throw new Error(`Native host ${explicit[0].instanceId} failed: ${explicit[0].error.message}`);
+  warnFailures(failed, warn);
+  if (!hosts.length) throw new Error(UNAVAILABLE);
+  if (!profile) return hosts;
+  const matched = hosts.filter(entry => matchesProfile(entry.host, profile));
+  if (!matched.length) throw new Error(`No connected profile matches --profile ${profile}. Connected: ${describe(hosts)}`);
+  return matched;
+}
+
+// Query tabs on each host; a failing host is skipped unless the user named it.
+async function collectTabs(hosts, options, profile, connect, warn) {
+  const results = await Promise.allSettled(hosts.map(entry => request('tabs', options, entry.path, connect)));
+  const lists = [];
+  results.forEach((result, index) => {
+    const entry = hosts[index];
+    if (result.status === 'fulfilled') lists.push({ entry, tabs: result.value.tabs, host: result.value.host });
+    else if (profile) throw new Error(`Native host ${entry.host.instanceId} failed: ${result.reason.message}`);
+    else warn(`Skipping native host ${entry.host.instanceId}: ${result.reason.message}`);
+  });
+  return lists;
+}
+
+function single(hosts, reason) {
+  if (hosts.length === 1) return hosts[0];
+  throw new Error(`${reason} matches ${hosts.length} browser profiles; pass --profile <name|dir|instanceId>. Connected: ${describe(hosts)}`);
+}
+
+async function selectStartHost(hosts, options, connect, warn) {
+  if (hosts.length === 1) return hosts[0];
+  if (!/^\d+$/.test(options.tab)) return single(hosts, options.profile ? `--profile ${options.profile}` : `--tab ${options.tab}`);
+  const lists = await collectTabs(hosts, {}, options.profile, connect, warn);
+  const owners = lists.filter(({ tabs }) => tabs.some(tab => tab.id === Number(options.tab))).map(({ entry }) => entry);
+  if (!owners.length) throw new Error(`Tab ${options.tab} was not found in any connected profile`);
+  return single(owners, `--tab ${options.tab}`);
+}
+
+function selectSessionHost(hosts, options) {
+  if (options.session) {
+    const owner = hosts.find(entry => entry.sessions.some(s => s.id === options.session));
+    if (!owner) throw new Error('Session ID does not match');
+    return owner;
+  }
+  if (hosts.length === 1) return hosts[0];
+  const all = hosts.flatMap(entry => entry.sessions.map(s => ({ ...s, profile: entry.host })));
+  if (!all.length) throw new Error('No active session');
+  if (all.length > 1) throw new Error(`--session is required: ${JSON.stringify(all)}`);
+  return hosts.find(entry => entry.sessions.length);
+}
+
+export async function main(argv, { dir = hostsDir, connect, config = loadConfig, warn = message => console.error(message) } = {}) {
   const { command, options: parsed } = parseArgs(argv);
-  let options = parsed;
-  if (['install', 'uninstall'].includes(command)) return install(command, options);
+  if (['install', 'uninstall'].includes(command)) return install(command, parsed);
   if (command === 'encode') {
-    const path = await encodeRecording(options.directory, { output: options.output, ffmpeg: options.ffmpeg });
+    const path = await encodeRecording(parsed.directory, { output: parsed.output, ffmpeg: parsed.ffmpeg });
     return { path };
   }
-  if (['start', 'record'].includes(command)) options = authorizePause(options, await loadConfig());
-  return request(command, options);
+  const { profile, ...options } = parsed;
+  const hosts = filterHosts(await discoverHosts({ dir, connect }), profile, warn);
+  if (command === 'status') return hosts.flatMap(entry => entry.sessions.map(s => ({ ...s, profile: entry.host })));
+  if (command === 'tabs') {
+    const lists = await collectTabs(hosts, options, profile, connect, warn);
+    return lists.flatMap(({ entry, host, tabs }) => tabs.map(tab => ({ ...tab, profile: { ...host, instanceId: entry.host.instanceId } })));
+  }
+  if (['start', 'record'].includes(command)) {
+    const target = await selectStartHost(hosts, { ...options, profile }, connect, warn);
+    return request(command, authorizePause(options, await config()), target.path, connect);
+  }
+  return request(command, options, selectSessionHost(hosts, options).path, connect);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

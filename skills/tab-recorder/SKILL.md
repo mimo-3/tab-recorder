@@ -9,8 +9,8 @@ tab-recorder captures one tab through CDP screencast and writes an MP4. It needs
 
 ## Before recording
 
-1. `tab-recorder status` must return JSON. An error about the socket or host means the browser is closed or the extension is not loaded. Stop and report it. Do not run `install` or `uninstall` yourself.
-2. `tab-recorder tabs` lists tab IDs, titles and URLs. Pass a numeric ID to `--tab`. Avoid `--tab active` because the active tab changes when someone else switches tabs. A URL substring works only when it matches exactly one tab.
+1. `tab-recorder status` must return JSON. An error about the host means no browser profile with the extension is running. The extension reconnects by itself within about 30 seconds, so wait 30 seconds and retry once. If it still fails, stop and report it. Do not run `install` or `uninstall` yourself.
+2. `tab-recorder tabs` lists tab IDs, titles and URLs with the `profile` they belong to. Pass a numeric ID to `--tab`. Avoid `--tab active` because the active tab changes when someone else switches tabs. A URL substring works only when it matches exactly one tab.
 3. The tab must be painting. A tab that is not visible in any window emits no frames. Tabs opened by an `aside exec` task that has finished often stop painting. Keep the tab active in its window, or hold it open with an `aside repl` session for the length of the recording.
 4. Do not record tabs showing meetings, mail or chat unless the user asked for that tab. The video contains everything the tab shows.
 
@@ -34,9 +34,13 @@ tab-recorder stop --session <id> -o /abs/path/demo.mp4
 - Start the recording before you set up page state. If extensions are configured to pause, starting reloads the tab and the state is lost.
 - Use `discard --session <id>` to drop a session without encoding.
 
+## Several profiles
+
+Each Aside or Chrome profile with the extension loaded runs its own host. `status` and `tabs` cover all of them. A numeric `--tab` picks its profile automatically. If the command says the selector matches several profiles, add `--profile <profileName|profileDir|instanceId prefix>` taken from the `profile` field of `tabs`. `stop` and `discard` with `--session` find the right profile by themselves.
+
 ## Several tabs at once
 
-- Up to 4 sessions can run at the same time, one per tab. Recording the same tab twice is rejected.
+- Up to 4 sessions can run at the same time per profile, one per tab. Recording the same tab twice is rejected.
 - Start each `record` as its own background command. A `record` that ends or is killed stops only its own session.
 - Always pass `--session <id>` to `stop` and `discard`, even when only one session is active. Without it, the command acts on whatever single session exists, which may belong to another agent. With two or more sessions active, the flag is required. `status` lists every session.
 
