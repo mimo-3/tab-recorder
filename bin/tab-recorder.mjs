@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import net from 'node:net';
-import { mkdir, writeFile, unlink, access, realpath, stat, readdir, lstat } from 'node:fs/promises';
+import { mkdir, writeFile, unlink, access, realpath, stat, readdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, resolve, isAbsolute } from 'node:path';
@@ -94,32 +94,29 @@ export function request(command, options, path, connect = net.createConnection) 
 
 const UNAVAILABLE = 'Native host unavailable: no browser profile is connected. Open Aside or Chrome with the extension loaded and run tab-recorder install.';
 
-// Ask every per-profile socket for its status. Dead sockets are skipped.
+// Ask every per-profile socket for its status. Never unlink here: a new host for the
+// same instance may be rebinding the path, and host listen() already removes stale sockets.
 export async function discoverHosts({ dir = hostsDir, connect } = {}) {
   let names;
   try { names = await readdir(dir); }
-  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  const sockets = names.map(name => SOCKET_NAME_PATTERN.exec(name)?.[1])
+  catch (error) { if (error.code === 'ENOENT') return { hosts: [], failed: [] }; throw error; }
+  const ids = names.map(name => SOCKET_NAME_PATTERN.exec(name)?.[1])
     .filter(id => id && INSTANCE_ID_PATTERN.test(id)).sort();
-  const found = await Promise.all(sockets.map(async id => {
+  const results = await Promise.allSettled(ids.map(async id => {
     const path = join(dir, `${id}.sock`);
-    try {
-      const { host, sessions } = await request('status', {}, path, connect);
-      return { path, host: { ...host, instanceId: id }, sessions };
-    } catch (error) {
-      if (error.code === 'ECONNREFUSED') await removeStaleSocket(path);
-      if (['ECONNREFUSED', 'ENOENT'].includes(error.code)) return undefined;
-      throw error;
-    }
+    const { host, sessions } = await request('status', {}, path, connect);
+    return { path, host: { ...host, instanceId: id }, sessions };
   }));
-  return found.filter(Boolean);
+  const hosts = [], failed = [];
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') hosts.push(result.value);
+    else if (!['ECONNREFUSED', 'ENOENT'].includes(result.reason.code)) failed.push({ instanceId: ids[index], error: result.reason });
+  });
+  return { hosts, failed };
 }
 
-async function removeStaleSocket(path) {
-  try {
-    const info = await lstat(path);
-    if (info.isSocket() && info.uid === process.getuid()) await unlink(path);
-  } catch (error) { ignoreMissing(error); }
+function warnFailures(failed, warn) {
+  for (const { instanceId, error } of failed) warn(`Skipping native host ${instanceId}: ${error.message}`);
 }
 
 export function matchesProfile(host, value) {
@@ -130,7 +127,10 @@ function describe(hosts) {
   return hosts.map(({ host }) => `${host.browser ?? 'unknown'}/${host.profileDir ?? '?'} "${host.profileName ?? '?'}" ${host.instanceId}`).join(', ');
 }
 
-function filterHosts(hosts, profile) {
+function filterHosts({ hosts, failed }, profile, warn) {
+  const explicit = profile ? failed.filter(entry => entry.instanceId.startsWith(profile.toLowerCase())) : [];
+  if (explicit.length) throw new Error(`Native host ${explicit[0].instanceId} failed: ${explicit[0].error.message}`);
+  warnFailures(failed, warn);
   if (!hosts.length) throw new Error(UNAVAILABLE);
   if (!profile) return hosts;
   const matched = hosts.filter(entry => matchesProfile(entry.host, profile));
@@ -138,19 +138,29 @@ function filterHosts(hosts, profile) {
   return matched;
 }
 
+// Query tabs on each host; a failing host is skipped unless the user named it.
+async function collectTabs(hosts, options, profile, connect, warn) {
+  const results = await Promise.allSettled(hosts.map(entry => request('tabs', options, entry.path, connect)));
+  const lists = [];
+  results.forEach((result, index) => {
+    const entry = hosts[index];
+    if (result.status === 'fulfilled') lists.push({ entry, tabs: result.value.tabs, host: result.value.host });
+    else if (profile) throw new Error(`Native host ${entry.host.instanceId} failed: ${result.reason.message}`);
+    else warn(`Skipping native host ${entry.host.instanceId}: ${result.reason.message}`);
+  });
+  return lists;
+}
+
 function single(hosts, reason) {
   if (hosts.length === 1) return hosts[0];
   throw new Error(`${reason} matches ${hosts.length} browser profiles; pass --profile <name|dir|instanceId>. Connected: ${describe(hosts)}`);
 }
 
-async function selectStartHost(hosts, options, connect) {
-  if (hosts.length === 1 || options.profile) return single(hosts, `--profile ${options.profile}`);
-  if (!/^\d+$/.test(options.tab)) return single(hosts, `--tab ${options.tab}`);
-  const owners = [];
-  for (const entry of hosts) {
-    const { tabs } = await request('tabs', {}, entry.path, connect);
-    if (tabs.some(tab => tab.id === Number(options.tab))) owners.push(entry);
-  }
+async function selectStartHost(hosts, options, connect, warn) {
+  if (hosts.length === 1) return hosts[0];
+  if (!/^\d+$/.test(options.tab)) return single(hosts, options.profile ? `--profile ${options.profile}` : `--tab ${options.tab}`);
+  const lists = await collectTabs(hosts, {}, options.profile, connect, warn);
+  const owners = lists.filter(({ tabs }) => tabs.some(tab => tab.id === Number(options.tab))).map(({ entry }) => entry);
   if (!owners.length) throw new Error(`Tab ${options.tab} was not found in any connected profile`);
   return single(owners, `--tab ${options.tab}`);
 }
@@ -168,7 +178,7 @@ function selectSessionHost(hosts, options) {
   return hosts.find(entry => entry.sessions.length);
 }
 
-export async function main(argv, { dir = hostsDir, connect, config = loadConfig } = {}) {
+export async function main(argv, { dir = hostsDir, connect, config = loadConfig, warn = message => console.error(message) } = {}) {
   const { command, options: parsed } = parseArgs(argv);
   if (['install', 'uninstall'].includes(command)) return install(command, parsed);
   if (command === 'encode') {
@@ -176,14 +186,14 @@ export async function main(argv, { dir = hostsDir, connect, config = loadConfig 
     return { path };
   }
   const { profile, ...options } = parsed;
-  const hosts = filterHosts(await discoverHosts({ dir, connect }), profile);
+  const hosts = filterHosts(await discoverHosts({ dir, connect }), profile, warn);
   if (command === 'status') return hosts.flatMap(entry => entry.sessions.map(s => ({ ...s, profile: entry.host })));
   if (command === 'tabs') {
-    const lists = await Promise.all(hosts.map(entry => request('tabs', options, entry.path, connect)));
-    return lists.flatMap(({ host, tabs }, index) => tabs.map(tab => ({ ...tab, profile: { ...host, instanceId: hosts[index].host.instanceId } })));
+    const lists = await collectTabs(hosts, options, profile, connect, warn);
+    return lists.flatMap(({ entry, host, tabs }) => tabs.map(tab => ({ ...tab, profile: { ...host, instanceId: entry.host.instanceId } })));
   }
   if (['start', 'record'].includes(command)) {
-    const target = await selectStartHost(hosts, { ...options, profile }, connect);
+    const target = await selectStartHost(hosts, { ...options, profile }, connect, warn);
     return request(command, authorizePause(options, await config()), target.path, connect);
   }
   return request(command, options, selectSessionHost(hosts, options).path, connect);

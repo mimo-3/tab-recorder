@@ -1,11 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, symlink, realpath, lstat, readFile } from 'node:fs/promises';
-import net from 'node:net';
+import { mkdtemp, mkdir, writeFile, rm, symlink, realpath, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Duplex } from 'node:stream';
-import { findFfmpeg, request, main, discoverHosts } from '../bin/tab-recorder.mjs';
+import { findFfmpeg, request, main } from '../bin/tab-recorder.mjs';
 
 async function temporary(t) {
   const dir = await mkdtemp(join(tmpdir(), 'tabrec-prof-cli-'));
@@ -61,7 +60,7 @@ test('offline encode runs without native host and preserves existing concat safe
 
 const ID_A = '11111111-1111-4111-8111-111111111111';
 const ID_B = '22222222-2222-4222-8222-222222222222';
-const ID_DEAD = '33333333-3333-4333-8333-333333333333';
+const ID_BROKEN = '33333333-3333-4333-8333-333333333333';
 const ID_GONE = '44444444-4444-4444-8444-444444444444';
 
 // Fake per-profile hosts keyed by socket path; records each request it serves.
@@ -75,7 +74,8 @@ function fakeHosts(dir, hosts) {
         const req = JSON.parse(chunk.toString());
         calls.push([id, req.command, req.options]);
         const data = hosts[id].handle(req);
-        socket.push(JSON.stringify({ ok: true, data }) + '\n');
+        const response = data?.fail ? { ok: false, error: data.fail } : { ok: true, data };
+        socket.push(JSON.stringify(response) + '\n');
         socket.push(null);
         callback();
       },
@@ -91,12 +91,12 @@ function fakeHosts(dir, hosts) {
   return { connect, calls };
 }
 
-function profileHost(id, { name, dir, tabs = [], sessions = [] }) {
+function profileHost(id, { name, dir, tabs = [], sessions = [], tabsFail }) {
   const host = { instanceId: id, browser: 'aside', profileDir: dir, profileName: name };
   return {
     handle(req) {
       if (req.command === 'status') return { host, sessions };
-      if (req.command === 'tabs') return { host, tabs };
+      if (req.command === 'tabs') return tabsFail ? { fail: tabsFail } : { host, tabs };
       return { routed: id, command: req.command, options: req.options };
     },
   };
@@ -112,7 +112,7 @@ async function hostsFixture(t) {
   for (const id of [ID_A, ID_B, ID_GONE]) await writeFile(join(dir, `${id}.sock`), '');
   await writeFile(join(dir, 'not-a-host.sock'), '');
   const fake = fakeHosts(dir, hosts);
-  return { dir, hosts, ...fake, run: argv => main(argv, { dir, connect: fake.connect, config: async () => ({ pauseExtensions: [] }) }) };
+  return { dir, hosts, ...fake, warnings: [], run(argv) { return main(argv, { dir, connect: fake.connect, config: async () => ({ pauseExtensions: [] }), warn: message => this.warnings.push(message) }); } };
 }
 
 test('status and tabs aggregate every live profile and tag each row', async t => {
@@ -165,16 +165,32 @@ test('single profile keeps the old behavior and zero profiles explain the fix', 
   await assert.rejects(main(['status'], { dir: join(empty, 'missing') }), /Native host unavailable/);
 });
 
-test('refused sockets are removed only when they are real sockets', async t => {
-  const dir = await mkdtemp('/tmp/tabrec-prof-');
-  t.after(() => rm(dir, { recursive: true, force: true }));
-  const live = net.createServer();
-  const socketFile = join(dir, `${ID_DEAD}.sock`);
-  await new Promise(resolve => live.listen(socketFile, resolve));
-  t.after(() => live.close());
-  await writeFile(join(dir, `${ID_GONE}.sock`), 'regular file');
-  const { connect } = fakeHosts(dir, { [ID_DEAD]: { error: 'ECONNREFUSED' }, [ID_GONE]: { error: 'ECONNREFUSED' } });
-  assert.deepEqual(await discoverHosts({ dir, connect }), []);
-  await assert.rejects(lstat(socketFile), { code: 'ENOENT' });
-  assert.equal(await readFile(join(dir, `${ID_GONE}.sock`), 'utf8'), 'regular file');
+test('dead sockets are skipped and never removed by the CLI', async t => {
+  const f = await hostsFixture(t);
+  f.hosts[ID_B] = { error: 'ECONNREFUSED' };
+  assert.deepEqual((await f.run(['status'])).map(s => s.id), ['sa']);
+  assert.equal(await readFile(join(f.dir, `${ID_B}.sock`), 'utf8'), '');
+  assert.equal(await readFile(join(f.dir, `${ID_GONE}.sock`), 'utf8'), '');
+  assert.deepEqual(f.warnings, []);
+});
+
+test('a failing host is skipped with a warning unless --profile names it', async t => {
+  const f = await hostsFixture(t);
+  await writeFile(join(f.dir, `${ID_BROKEN}.sock`), '');
+  f.hosts[ID_BROKEN] = { error: 'ETIMEDOUT' };
+  assert.deepEqual((await f.run(['status'])).map(s => s.id), ['sa', 'sb']);
+  assert.match(f.warnings[0], new RegExp(`Skipping native host ${ID_BROKEN}`));
+  await assert.rejects(f.run(['status', '--profile', '3333']), new RegExp(`Native host ${ID_BROKEN} failed`));
+  f.hosts[ID_B] = profileHost(ID_B, { name: 'Personal', dir: 'Profile 1', tabsFail: 'Response too large' });
+  assert.deepEqual((await f.run(['tabs'])).map(tab => tab.id), [1, 2]);
+  assert.ok(f.warnings.some(message => message.includes('Response too large')));
+  assert.equal((await f.run(['start', '--tab', '2'])).routed, ID_A);
+  await assert.rejects(f.run(['tabs', '--profile', 'Personal']), /Response too large/);
+});
+
+test('numeric --tab picks the owner among several hosts matching --profile', async t => {
+  const f = await hostsFixture(t);
+  f.hosts[ID_B] = profileHost(ID_B, { name: 'Work', dir: 'Profile 1', tabs: [{ id: 7 }] });
+  assert.equal((await f.run(['start', '--tab', '7', '--profile', 'Work'])).routed, ID_B);
+  await assert.rejects(f.run(['start', '--tab', 'active', '--profile', 'Work']), /--profile Work matches 2 browser profiles/);
 });
