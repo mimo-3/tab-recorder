@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createConnection, ensureReconnectAlarm, instanceId, RECONNECT_ALARM} from '../extension/lib/connection.js';
+import {createConnection, ensureReconnectAlarm, instanceId, RECONNECT_ALARM, READY_TIMEOUT_MS} from '../extension/lib/connection.js';
 
 function event() {
   const listeners = [];
@@ -34,7 +34,8 @@ function mockChrome({failConnect = 0} = {}) {
 
 function timers() {
   const pending = [];
-  return {pending, set: (fn, ms) => { pending.push({fn, ms}); return pending.length; }, clear: () => {}};
+  const retries = () => pending.filter(p => p.ms !== READY_TIMEOUT_MS);
+  return {pending, retries, set: (fn, ms) => { pending.push({fn, ms}); return pending.length; }, clear: () => {}};
 }
 
 const quiet = {warn: () => {}};
@@ -45,6 +46,31 @@ test('instance ID is generated once and persisted', async () => {
   assert.match(first, /^[0-9a-f-]{36}$/);
   assert.equal(await instanceId(m.chrome), first);
   assert.equal(m.local.instanceId, first);
+});
+
+test('a stored instance ID that is not a UUID is replaced', async () => {
+  const m = mockChrome();
+  m.local.instanceId = '../escape';
+  const replaced = await instanceId(m.chrome);
+  assert.match(replaced, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(m.local.instanceId, replaced);
+});
+
+test('connect waits for cleanup but gives up waiting after the time limit', async () => {
+  const m = mockChrome();
+  let finish;
+  const cleanup = new Promise(resolve => { finish = resolve; });
+  const c = createConnection(m.chrome, {hostName: 'host', onMessage: () => {}, ready: () => cleanup, logger: quiet});
+  const opening = c.connect();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(m.ports.length, 0);
+  finish();
+  await opening;
+  assert.equal(m.ports.length, 1);
+  const hung = mockChrome();
+  const stuck = createConnection(hung.chrome, {hostName: 'host', onMessage: () => {}, ready: () => new Promise(() => {}), readyTimeoutMs: 20, logger: quiet});
+  await stuck.connect();
+  assert.equal(hung.ports.length, 1);
 });
 
 test('connect sends hello first and concurrent wake-ups open one port', async () => {
@@ -70,7 +96,7 @@ test('disconnect cleans up, retries soon and the alarm path reconnects with the 
   m.ports[0].onDisconnect.fire();
   assert.equal(cleanups, 1);
   assert.equal(c.connected(), false);
-  assert.equal(t.pending[0].ms, 1_000);
+  assert.equal(t.retries()[0].ms, 1_000);
   // The worker may be suspended before the timer fires; an alarm wake-up must still reconnect.
   await c.connect();
   assert.equal(m.ports.length, 2);
@@ -84,7 +110,7 @@ test('failed connections back off up to 30 seconds', async () => {
   const t = timers();
   const c = createConnection(m.chrome, {hostName: 'host', onMessage: () => {}, setTimer: t.set, clearTimer: t.clear, logger: quiet});
   for (let i = 0; i < 7; i++) await c.connect();
-  assert.deepEqual(t.pending.map(p => p.ms), [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+  assert.deepEqual(t.retries().map(p => p.ms), [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
   assert.equal(c.connected(), false);
 });
 
@@ -123,6 +149,13 @@ test('service worker registers the alarm listener at top level and reconnects on
     await settle();
     assert.equal(m.ports.length, 2);
     assert.equal(m.ports[1].sent[0].instanceId, m.ports[0].sent[0].instanceId);
+    // A dispatch that never settles must not block the alarm path.
+    m.chrome.tabs = {query: () => new Promise(() => {})};
+    m.ports[1].onMessage.fire({type: 'tabs', id: 'hung'});
+    m.ports[1].onDisconnect.fire();
+    m.chrome.alarms.onAlarm.fire({name: RECONNECT_ALARM});
+    await new Promise(resolve => setTimeout(resolve, READY_TIMEOUT_MS + 100));
+    assert.equal(m.ports.length, 3);
   } finally {
     delete globalThis.chrome;
   }

@@ -4,10 +4,14 @@ export const RECONNECT_PERIOD_MINUTES = 0.5;
 export const INSTANCE_KEY = 'instanceId';
 const INITIAL_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 30_000;
+// Reconnect even if cleanup never settles, e.g. behind a hung dispatch.
+export const READY_TIMEOUT_MS = 5_000;
+// Keep in sync with INSTANCE_ID_PATTERN in lib/core.mjs.
+const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export async function instanceId(chrome) {
   const saved = (await chrome.storage.local.get(INSTANCE_KEY))[INSTANCE_KEY];
-  if (typeof saved === 'string' && saved) return saved;
+  if (typeof saved === 'string' && INSTANCE_ID_PATTERN.test(saved)) return saved;
   const created = crypto.randomUUID();
   await chrome.storage.local.set({[INSTANCE_KEY]: created});
   return created;
@@ -23,6 +27,8 @@ export function createConnection(chrome, {
   hostName,
   onMessage,
   onDisconnect = () => {},
+  ready = () => {},
+  readyTimeoutMs = READY_TIMEOUT_MS,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
   logger = console,
@@ -38,7 +44,18 @@ export function createConnection(chrome, {
     retryDelay = Math.min(retryDelay * 2, MAX_RETRY_MS);
   }
 
+  async function waitReady() {
+    let timer;
+    const timeout = new Promise(resolve => { timer = setTimer(resolve, readyTimeoutMs); });
+    try {
+      await Promise.race([Promise.resolve(ready()).catch(error => logger.warn('Cleanup before connect failed', error)), timeout]);
+    } finally {
+      clearTimer(timer);
+    }
+  }
+
   async function open() {
+    await waitReady();
     const id = await instanceId(chrome);
     if (port) return;
     try {
